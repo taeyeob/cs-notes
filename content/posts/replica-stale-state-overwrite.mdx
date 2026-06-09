@@ -1,0 +1,89 @@
+---
+title: "Replica 지연이 만드는 stale 덮어쓰기 문제"
+date: "2026-06-09"
+summary: "read/write 분리 환경에서 replica 읽기가 단순 성능 선택이 아닌 정합성 선택임을 보여주는 장애 패턴과 설계 기준을 정리한다."
+tags:
+  - backend
+  - database
+  - consistency
+---
+
+## 문제 정의
+
+read/write 분리(primary-replica)를 사용하는 백엔드에서 "replica에서 읽어도 되는가"는 보통 성능 문제로 분류한다. 그러나 읽은 값을 나중에 다시 저장하는 경로가 있다면 이는 정합성 문제가 된다.
+
+전형적인 장애 시나리오는 이렇다. 어드민이 어떤 객체의 상태를 바꾸어 primary에 기록했다. 그 직후 외부 시스템 콜백이 들어와서 같은 객체를 조회했는데, replica에는 아직 이전 상태가 남아 있었다. 콜백 핸들러는 stale 객체를 완성해서 그대로 저장했고, primary에 막 쓰인 최신 상태가 덮어써졌다. 결과적으로 취소된 레코드가 다시 활성 상태로 돌아온다.
+
+## 실패 모드 해부
+
+이 패턴이 위험한 이유는 증상이 즉시 나타나지 않기 때문이다.
+
+1. **primary write** — 상태를 `CANCELED`로 변경, primary에 반영
+2. **replica lag** — 동기화 지연(수 ms~수백 ms)으로 replica는 아직 이전 상태
+3. **callback read from replica** — 핸들러가 replica에서 `PENDING` 상태 객체를 로딩
+4. **stale save** — 핸들러가 객체 필드를 채워 `save()` 호출, `PENDING` 상태로 덮어씀
+5. **silent corruption** — 이후 조회에서 `CANCELED`는 사라지고 `PENDING`이 다시 보임
+
+각 단계는 정상처럼 보인다. 예외도 없고 로그도 깨끗하다. 테스트가 단일 DB나 동기 replica를 사용하면 재현도 안 된다.
+
+## 코드로 보는 위험 패턴과 안전 패턴
+
+```python
+# 위험: replica에서 전체 객체 로딩 후 save()
+def handle_callback_unsafe(order_id, payload):
+    order = Order.objects.using("replica").get(id=order_id)  # stale 가능
+    order.external_ref = payload["ref"]
+    order.save()  # stale 상태를 primary에 덮어씀
+
+# 안전 1: primary에서 읽기
+def handle_callback_safe_primary(order_id, payload):
+    order = Order.objects.get(id=order_id)  # primary (default)
+    order.external_ref = payload["ref"]
+    order.save()
+
+# 안전 2: 변경할 필드만 update_fields로 지정
+def handle_callback_safe_fields(order_id, payload):
+    Order.objects.filter(id=order_id).update(
+        external_ref=payload["ref"]
+    )  # 상태 필드를 건드리지 않음
+
+# 안전 3: 외부 payload로 상태 판단 (stale 모델 필드 의존 않음)
+def classify_from_payload(payload):
+    return "CANCELED" if payload["balance_amount"] == 0 else "ACTIVE"
+```
+
+`save()`는 객체 전체를 덮어쓴다. `update_fields`나 `.update()`는 지정한 컬럼만 건드린다. 상태 필드처럼 다른 경로에서 동시에 변경될 수 있는 컬럼은 stale 객체에서 읽어오지 않는 것이 원칙이다.
+
+## 설계 원칙
+
+**read path는 정합성 결정이다.** replica 읽기는 "변경 없이 조회만 한다"는 전제에서만 안전하다. 읽은 값을 다시 저장하는 순간, replica와 primary 사이의 lag이 데이터 손실로 이어진다.
+
+상태를 변경하는 콜백 핸들러에서 지켜야 할 기준:
+
+- 상태 판단에 쓰이는 값은 primary에서 읽는다.
+- 외부 payload에 충분한 정보가 있다면 DB 조회 자체를 줄이는 것이 더 안전하다.
+- 전체 객체 `save()`보다 `update_fields` 또는 `.update()` 쿼리를 우선한다.
+- 뒤따르는 확인 경로(downstream guard)에서도 현재 상태를 재확인한다. 이미 취소된 레코드라면 이후 단계가 진행되지 않도록 조기 차단한다.
+
+## 트레이드오프
+
+primary 읽기를 늘리면 DB 부하가 증가한다. 이 부담이 실제로 크다면 두 가지 대안을 검토한다.
+
+- **필드 선택 읽기**: 전체 객체 대신 상태 판단에 필요한 컬럼만 primary에서 조회하고, 나머지는 payload로 처리한다.
+- **낙관적 잠금 / 조건부 업데이트**: `UPDATE ... WHERE status = 'PENDING'` 형태로 예상 상태일 때만 업데이트하고, 영향받은 행이 0이면 충돌로 처리한다.
+
+읽기 경로를 바꾸기 전에 "이 읽기 결과가 나중에 저장되는가"를 먼저 물어야 한다. 저장되지 않는다면 replica가 여전히 적합하다.
+
+## 검증 체크리스트
+
+이 패턴에 해당하는 변경을 리뷰할 때 확인한다.
+
+- 콜백·이벤트 핸들러에서 객체를 조회하는 DB 힌트가 replica인가
+- 그 객체가 이후에 `save()` 또는 bulk update로 다시 저장되는가
+- 상태 전환 조건이 DB 모델 필드 값에 의존하는가, 아니면 외부 payload 값에 의존하는가
+- 상태 변경 이후 동일 레코드를 처리하는 downstream 경로에 방어 가드가 있는가
+- 테스트가 replica lag을 시뮬레이션하는가, 또는 단일 DB에서만 통과하는 조건인가
+
+## 배운 것
+
+replica lag은 평소에는 보이지 않는다. 문제는 "읽고 저장"하는 경로가 생길 때 비로소 드러난다. read/write 분리를 도입한 시스템에서 콜백이나 이벤트 핸들러를 작성할 때는 읽기 소스 선택이 성능 최적화가 아닌 정합성 보장의 문제임을 전제로 해야 한다. `save()` 한 줄이 다른 경로에서 어렵게 기록한 상태를 조용히 지워버릴 수 있다.
