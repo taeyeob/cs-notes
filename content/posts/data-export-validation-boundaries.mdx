@@ -1,0 +1,147 @@
+---
+title: "운영 데이터 보정 산출물을 검증 가능하게 만들기"
+date: "2026-06-10"
+summary: "단순 CSV 추출이 아니라 대상 선정부터 JSON escape 검증, 적용 전후 비교 SQL까지 산출물 경계를 명확히 하는 방법을 정리한다."
+tags:
+  - backend
+  - data
+  - validation
+  - operations
+---
+
+## 문제 정의
+
+운영 데이터를 일괄 보정할 때 가장 흔한 실수는 "일단 추출하고 나중에 확인하자"는 순서다. 대상을 먼저 SELECT로 뽑고, 그 결과를 바탕으로 UPDATE 스크립트를 만들고, 적용하고 나서야 뭔가 이상함을 느끼는 흐름이다.
+
+특히 기존 필드에 값을 append하는 작업은 위험도가 높다. 기존 값을 덮어쓰지 않는다는 보장이 없고, newline이나 특수문자가 섞이면 API나 DB 계층에서 파싱 오류가 조용히 발생한다. 작업 전에 "이 산출물이 틀렸을 때 어떻게 되는가"를 먼저 생각하고, 검증 단계를 산출물의 일부로 포함시키는 것이 낫다.
+
+## 안전한 산출물 경계
+
+산출물을 만들기 전에 경계를 정한다. 핵심 원칙은 하나다: **산출물은 DB를 직접 건드리지 않는다.**
+
+실제로 만드는 파일은 네 가지다.
+
+- **Excel preview**: 사람이 눈으로 확인하는 용도. `order_id`, `before`, `after` 세 컬럼이면 충분하다.
+- **JSON payload**: API나 Postman에서 직접 쓸 수 있는 형태. `{"delivery_request_list": [...]}` 형태의 일반 JSON으로 만든다.
+- **txt 요약**: 행 수, 대상 그룹 분포, 수량 범위를 사람이 읽을 수 있는 형태로 정리한다.
+- **비교 SQL**: 적용 후 결과를 확인하기 위한 SELECT 쿼리. 미리 작성해서 산출물과 함께 보관한다.
+
+이 네 가지를 동시에 만들면 어느 하나가 어긋났을 때 다른 것으로 교차 검증할 수 있다.
+
+### 대상 선정 기준을 명시적으로 고정한다
+
+대상이 되는 주문을 결정하는 조건을 쿼리 안에 인라인으로 적지 않는다. 조건을 한 곳에 모아서 이후 단계가 모두 같은 집합을 참조하게 만든다.
+
+```sql
+-- 1단계: 대상 집합 정의
+WITH target_orders AS (
+  SELECT order_id, group_id, quantity
+  FROM orders
+  WHERE group_id IN (/* 대상 그룹 */)
+    AND status = 'confirmed'
+),
+-- 2단계: 대표 주문 기준 계산
+representative AS (
+  SELECT order_id,
+         FLOOR(quantity / :unit) AS gift_count
+  FROM target_orders
+  WHERE /* 대표 주문 조건 */
+)
+SELECT * FROM representative
+WHERE gift_count > 0;
+```
+
+`target_orders` CTE를 변경하면 이후 모든 계산이 자동으로 바뀐다. 조건이 여러 곳에 흩어진 쿼리는 한 곳을 고쳤을 때 다른 곳이 어긋나기 쉽다.
+
+### append 값을 생성할 때 원본을 건드리지 않는다
+
+기존 필드 값을 `before`로, 새 문구를 붙인 결과를 `after`로 선언한다. 이 시점에서는 SELECT만 실행한다.
+
+```sql
+SELECT
+  order_id,
+  delivery_note AS before,
+  delivery_note || '\n' || :new_text AS after
+FROM target_orders
+JOIN orders USING (order_id);
+```
+
+`after`가 비어 있거나 `before`와 같다면 조건이 잘못된 것이다. 이 결과가 Excel preview의 원본이 된다.
+
+## 개행과 escape 검증
+
+JSON payload에서 가장 많이 틀리는 부분이 개행 처리다. 두 가지 상태를 구분해야 한다.
+
+- **올바른 상태**: JSON 문자열 안에 `\n`이 두 글자(`\` + `n`)로 들어가 있고, 파싱 후 실제 newline 문자(`0x0A`)로 변환된다.
+- **잘못된 상태**: JSON 문자열 안에 실제 newline 문자가 그대로 들어가 있어서 파싱 자체가 실패하거나, `\\n`이 들어가서 파싱 후에도 여전히 `\n` 두 글자로 남는다.
+
+Python으로 간단히 검증한다.
+
+```python
+import json
+
+with open("payload.json") as f:
+    payload = json.load(f)  # 파싱 실패 시 여기서 터진다
+
+literal_newline = "\\n"
+for i, obj in enumerate(payload["delivery_request_list"]):
+    after = obj["delivery_note"]
+    assert chr(10) in after, f"row {i}: newline 없음"
+    assert literal_newline not in after, f"row {i}: literal \\n 포함"
+    assert after != obj.get("before", ""), f"row {i}: 변경 없음"
+```
+
+`json.load`가 성공해도 문자열 안에 실제 newline이 있는지, literal `\n`이 남아있지 않은지를 추가로 확인해야 한다. 파싱 성공과 올바른 값은 다른 문제다.
+
+Excel 재오픈도 한 번 확인한다. Excel은 셀 안의 개행을 자체적으로 처리하기 때문에, 저장 후 다시 열었을 때 `after` 컬럼이 정상적으로 보이면 데이터에 실제 newline이 포함된 것이다.
+
+## 적용 전후 검증
+
+### 적용 전 체크리스트
+
+산출물을 넘기기 전에 숫자를 두 번 확인한다.
+
+```
+- 전체 행 수 == DISTINCT order_id 수  (중복 없음)
+- 모든 order_id가 target_orders에 포함됨
+- gift_count 범위가 예상 범위 안에 있음 (예: 1~10)
+- after 값이 모두 비어있지 않음
+- before != after (변경이 실제로 발생함)
+```
+
+중복 여부 확인이 특히 중요하다. JOIN 조건이 잘못되면 같은 주문이 여러 번 등장할 수 있고, 그 상태로 API를 두 번 호출하면 문구가 두 번 붙는다.
+
+### 적용 후 비교 SQL
+
+산출물을 만들 때 비교 쿼리도 함께 작성해 둔다. 적용 직후에 이 쿼리를 돌려서 `after` 값과 실제 DB 값이 일치하는지 확인한다.
+
+```sql
+SELECT
+  o.order_id,
+  p.expected_after,
+  o.delivery_note AS actual,
+  CASE WHEN p.expected_after = o.delivery_note THEN 'OK' ELSE 'MISMATCH' END AS result
+FROM orders o
+JOIN payload_preview p USING (order_id)
+WHERE o.order_id IN (/* 산출물의 order_id 목록 */);
+```
+
+`MISMATCH`가 하나라도 있으면 원인을 파악한다. API가 값을 trim했거나, 기존 값이 예상과 달랐거나, 다른 프로세스가 동시에 같은 필드를 수정한 경우가 대부분이다.
+
+## 0건 확인도 산출물이다
+
+같은 조건을 다른 데이터 집합에 적용하려 했을 때 대상이 0건으로 나오는 경우가 있다. 이때 임의로 조건을 완화하거나, 빈 산출물 파일을 만들어서 진행하면 안 된다.
+
+0건이 나오면 멈추고 조건을 다시 확인한다.
+
+- 대상 그룹 ID가 실제로 존재하는가
+- 상태 조건(`confirmed` 등)을 만족하는 주문이 있는가
+- 날짜 범위나 다른 필터가 예상과 맞는가
+
+"0건이 맞다"는 확인이 끝나기 전까지는 산출물을 만들지 않는다. 조건이 틀렸는데 0건짜리 파일을 넘기면, 나중에 실제 적용 대상이 누락됐다는 사실을 알아차리기 어렵다.
+
+## 배운 것
+
+운영 데이터 보정 작업에서 실수가 발생하는 지점은 거의 정해져 있다. 대상 조건이 여러 곳에 중복 선언되거나, 개행이 escape되지 않은 상태로 JSON에 포함되거나, 적용 결과를 확인하는 쿼리가 없어서 이상 여부를 나중에야 발견하거나.
+
+산출물 경계를 "DB를 건드리지 않는 SELECT 기반"으로 고정하고, Excel/JSON/txt/비교 SQL을 동시에 만들면 어느 한 형태가 잘못됐을 때 다른 것으로 교차 확인할 수 있다. 검증 단계를 작업 완료 후로 미루지 말고, 산출물을 만들기 전에 먼저 정의해두는 것이 핵심이다.
