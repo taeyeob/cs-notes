@@ -1,0 +1,112 @@
+---
+title: "DB 트랜잭션 커밋 이후에만 Cloud Task를 예약해야 하는 이유"
+date: "2026-06-27"
+summary: "트랜잭션 내부에서 외부 큐에 작업을 예약하면 롤백이 발생해도 큐 항목은 취소되지 않는다. 이 문제의 실패 모드와 안전한 on_commit 패턴, 워커 측 방어 설계를 정리한다."
+tags:
+  - backend
+  - database
+  - cloud-tasks
+  - django
+---
+
+## 문제 정의
+
+Django `transaction.atomic()` 블록 안에서 Google Cloud Tasks에 작업을 예약하는 코드는 겉보기에 자연스럽다. DB에 레코드를 만든 직후 비동기 처리를 요청하면, 두 동작이 하나의 흐름처럼 느껴지기 때문이다.
+
+그러나 DB 트랜잭션과 외부 HTTP 큐는 서로 독립된 시스템이다. 트랜잭션이 롤백되면 DB 변경은 되돌아가지만, 이미 전달된 Cloud Task 요청은 되돌아오지 않는다. 워커가 나중에 실행될 때 DB에는 해당 레코드가 존재하지 않거나 예상과 다른 상태일 수 있다.
+
+## 실패 모드 타임라인
+
+다음 순서로 장애가 발생한다.
+
+1. **트랜잭션 시작** — `ATOMIC_REQUESTS` 또는 명시적 `transaction.atomic()` 블록 진입
+2. **DB 쓰기** — 주문·작업 레코드 등을 primary DB에 INSERT
+3. **Cloud Task 예약** — `tasks_v2.CloudTasksClient().create_task(...)` 호출 성공, 큐에 항목 등록됨
+4. **트랜잭션 롤백** — 이후 코드에서 예외 발생, DB 변경 취소
+5. **워커 실행** — Cloud Tasks가 지정된 시간에 엔드포인트를 호출, 없거나 다른 상태의 레코드를 만남
+6. **처리 실패 또는 오동작** — 레코드를 찾지 못하면 404/500, 찾더라도 의도하지 않은 상태를 기준으로 처리 진행
+
+장애 3번 단계는 성공 응답을 반환한다. 롤백은 4번에서 조용히 일어난다. 두 동작이 로그상 분리되어 있어 원인을 파악하기 어렵다.
+
+## 위험 패턴과 안전 패턴
+
+```python
+# 위험: 트랜잭션 내부에서 Cloud Task 예약
+def create_order_unsafe(user_id, items):
+    with transaction.atomic():
+        order = Order.objects.create(user_id=user_id, status="PENDING")
+        # 여기서 예약 — 트랜잭션이 롤백되어도 태스크는 남는다
+        enqueue_fulfillment_task(order.id)
+        _validate_inventory(items)  # 재고 부족 시 예외 → 롤백
+```
+
+```python
+# 안전: on_commit 콜백으로 커밋 이후에만 예약
+def create_order_safe(user_id, items):
+    with transaction.atomic():
+        order = Order.objects.create(user_id=user_id, status="PENDING")
+        _validate_inventory(items)
+        # 커밋이 완료된 뒤에만 실행된다
+        transaction.on_commit(
+            lambda: enqueue_fulfillment_task(order.id),
+            using="default",  # primary DB 커밋에 연동
+        )
+```
+
+`transaction.on_commit()`은 트랜잭션이 실제로 커밋될 때만 콜백을 실행한다. 롤백되면 콜백 자체가 호출되지 않는다. `using` 파라미터를 명시하면 읽기 전용 replica나 다른 DB alias와 혼용할 때 예기치 않은 동작을 방지할 수 있다.
+
+## 페이로드 최소화와 워커 측 방어
+
+Cloud Task 페이로드에는 레코드 ID만 담고, 실제 데이터는 워커가 커밋된 DB에서 직접 조회하는 것이 원칙이다.
+
+```python
+# 페이로드: {"order_id": 1234} 만 전달
+def handle_fulfillment_task(request):
+    order_id = request.json["order_id"]
+
+    with transaction.atomic():
+        try:
+            order = Order.objects.select_for_update().get(
+                id=order_id, status="PENDING"
+            )
+        except Order.DoesNotExist:
+            # 롤백으로 레코드가 없거나, 이미 다른 상태인 경우
+            return HttpResponse(status=200)  # 재시도하지 않음
+
+        if order.fulfillment_started_at:
+            return HttpResponse(status=200)  # 멱등성: 이미 처리됨
+
+        order.process()
+```
+
+워커가 레코드를 찾지 못하거나 상태가 맞지 않을 때 200을 반환하면 Cloud Tasks가 불필요하게 재시도하지 않는다. 실패가 예상된 상황(롤백 또는 중복 실행)과 예외 상황(진짜 오류)을 구분해서 응답 코드를 다르게 처리하는 것이 좋다.
+
+## 설계 원칙
+
+**외부 사이드 이펙트는 커밋 이후로 미룬다.** 이메일 발송, 외부 API 호출, 큐 예약 등 되돌릴 수 없는 동작은 DB 커밋이 확정된 뒤에만 실행해야 한다.
+
+**워커는 멱등하게 설계한다.** Cloud Tasks는 at-least-once 전달을 보장한다. 네트워크 문제나 재시도로 동일 태스크가 두 번 이상 실행될 수 있으므로, 처리 여부를 DB 상태로 확인하고 중복 실행을 방어해야 한다.
+
+**페이로드는 최소화한다.** 트랜잭션 시점의 스냅샷 데이터를 페이로드에 담으면, 워커 실행 시점의 DB 상태와 불일치가 생길 수 있다. ID만 전달하고 워커가 최신 상태를 조회하도록 설계하면 이 불일치를 피할 수 있다.
+
+## 트레이드오프
+
+`on_commit` 패턴을 사용하면 테스트에서 주의가 필요하다. `TestCase`는 각 테스트를 별도 트랜잭션으로 감싸고 롤백하기 때문에 `on_commit` 콜백이 실행되지 않는다. `TransactionTestCase`를 쓰거나, `on_commit` 호출 자체를 목(mock)으로 교체하는 별도 테스트 유틸리티를 두는 방법으로 우회할 수 있다.
+
+DB 커밋이 완료된 뒤 `on_commit` 콜백이 큐 등록을 완료하기 전에 프로세스가 종료되는 극단적인 상황에서는, DB 레코드는 커밋됐지만 태스크가 큐에 등록되지 않아 누락될 수 있다. 이 경우 누락된 태스크를 주기적으로 감지하는 별도 스윕(sweep) 잡을 두거나, 워커가 DB 상태만으로 처리 완결성을 보장하도록 설계하는 것이 현실적인 대안이다.
+
+## 검증 체크리스트
+
+이 패턴이 관련된 코드 리뷰에서 확인할 사항이다.
+
+- [ ] Cloud Task 예약 코드가 `transaction.atomic()` 블록 안에 있는가
+- [ ] `on_commit`으로 이동했다면 `using` 파라미터가 의도한 DB alias를 가리키는가
+- [ ] 워커가 레코드 부재 또는 상태 불일치를 200으로 처리하는가 (불필요한 재시도 차단)
+- [ ] 워커에 멱등성 가드가 있는가 (중복 실행 방어)
+- [ ] 테스트가 `on_commit`을 실제로 실행하는지, 아니면 조용히 건너뛰는지 확인했는가
+
+## 배운 것
+
+DB 트랜잭션과 외부 큐는 하나의 원자적 단위가 아니다. 코드가 같은 함수 안에 있어도 두 시스템의 실패 동작은 완전히 독립적이다. 트랜잭션 내부에서 외부 시스템을 호출하는 패턴은 "롤백 시 외부 호출도 취소된다"는 잘못된 가정을 심기 쉽다.
+
+`transaction.on_commit()`은 이 간극을 메우는 가장 단순한 도구다. 워커 측 멱등성 설계와 조합하면, 롤백·네트워크 재시도·중복 실행 모두를 안전하게 흡수하는 파이프라인을 만들 수 있다.
