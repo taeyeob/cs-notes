@@ -1,0 +1,172 @@
+---
+title: "관리자 저장 API가 외부 시스템 재동기화를 자동으로 보장하지 않는 이유"
+date: "2026-06-28"
+summary: "관리자에서 '저장'을 눌렀다고 해서 외부 이행 시스템이 자동으로 재동기화되는 것은 아니다. API 경로마다 side effect의 범위가 다르고, 재동기화는 payload 필드 계약에 의해 결정된다."
+tags:
+  - backend
+  - api
+  - integration
+  - operations
+---
+
+## 문제 정의
+
+운영 중에 외부 이행 시스템에서 특정 상품 데이터가 누락되는 오류가 발생했다. 초기 대응으로 자연스럽게 떠오르는 질문이 있다.
+
+"관리자 화면에서 해당 상품을 다시 저장하면 외부 시스템에 데이터가 다시 생성될까?"
+
+이 질문은 그럴듯해 보이지만, 두 가지 가정을 동시에 전제한다. 첫째, 저장 API가 항상 외부 시스템 동기화를 트리거한다. 둘째, 어떤 경로로 저장하든 동일한 side effect가 발생한다. 실제로는 두 가정 모두 틀릴 수 있다.
+
+## API 경로마다 side effect가 다르다
+
+관리자 화면의 '저장' 버튼은 단일 행위처럼 보이지만, 내부적으로는 수정 대상에 따라 서로 다른 API 엔드포인트를 호출한다. 대표적인 분기는 다음과 같다.
+
+- **상품 기본 정보 수정** (제목, 설명, 이미지 등): 상품 메타데이터만 업데이트하며, 외부 이행 시스템 동기화를 트리거하지 않을 수 있다.
+- **이벤트/옵션 수정**: 옵션 목록이나 이벤트 구성을 변경하며, 특정 필드가 payload에 포함될 때만 동기화가 발생한다.
+- **SKU 매핑 수정**: 외부 이행 시스템과 직결된 식별자를 다루며, 명시적인 SKU 코드 목록이 payload에 있어야 동기화 흐름이 시작된다.
+
+세 경로 모두 UI에서는 '저장'으로 표현되지만, 백엔드에서 실행되는 side effect의 범위는 전혀 다르다.
+
+## 재동기화는 payload 필드 계약으로 결정된다
+
+코드를 추적해보면 재동기화 트리거가 단순히 "API가 호출되었다"는 사실이 아니라, **payload에 특정 필드가 포함되어 있는가**에 따라 결정되는 패턴을 확인할 수 있다.
+
+```python
+def update_product(product_id, payload):
+    product = Product.objects.get(id=product_id)
+
+    # 기본 정보 업데이트 (항상 실행)
+    if "title" in payload:
+        product.title = payload["title"]
+    if "description" in payload:
+        product.description = payload["description"]
+    product.save()
+
+    # 외부 이행 시스템 동기화: option_list가 있을 때만 트리거
+    if "option_list" in payload:
+        sync_options_to_fulfillment(product, payload["option_list"])
+
+    # SKU 매핑 동기화: sku_code_list가 있을 때만 트리거
+    if "sku_code_list" in payload:
+        sync_sku_mapping(product, payload["sku_code_list"])
+```
+
+이 패턴에서 "관리자에서 제목만 수정하고 저장"하면 `title`만 payload에 담기고 `option_list`와 `sku_code_list`는 빠진다. 따라서 외부 이행 시스템 동기화 코드는 실행되지 않는다.
+
+"저장을 눌렀으니 동기화가 됐겠지"라는 기대는 이 계약을 모를 때 생긴다.
+
+## 빈 PATCH와 부분 수정은 재동기화가 아니다
+
+빈 payload 또는 기본 정보만 담긴 PATCH 요청은 외부 이행 시스템 입장에서는 아무 일도 일어나지 않는 것과 같다.
+
+```python
+# 이 요청은 외부 시스템 동기화를 트리거하지 않는다
+# PATCH /api/products/123/
+payload_no_sync = {
+    "title": "수정된 제목",
+    "thumbnail_url": "https://cdn.example.com/new-thumb.jpg",
+}
+
+# 이 요청은 외부 시스템 동기화를 트리거한다
+# PATCH /api/products/123/
+payload_with_sync = {
+    "title": "수정된 제목",
+    "option_list": [
+        {"id": 1, "name": "옵션 A", "bonus_list": [...]},
+    ],
+}
+```
+
+누락된 데이터를 복구하려는 목적으로 단순 편집을 시도할 경우, 실제로 재동기화가 일어나지 않았음에도 "저장했으니 됐겠지"라고 오판하는 상황이 생긴다.
+
+## idempotent API라도 전제 조건이 있다
+
+외부 이행 시스템으로의 PUT/upsert 호출이 idempotent하다는 것은 "동일 요청을 여러 번 보내도 결과가 같다"는 의미이지, "언제 보내도 성공한다"는 의미가 아니다. 재동기화가 트리거되더라도 다음 조건을 별도로 확인해야 한다.
+
+**SKU 자체가 외부 시스템에 존재하는가**
+
+내부 상품에 매핑된 SKU 코드가 외부 이행 시스템에 등록되어 있지 않으면 upsert가 성공해도 원하는 데이터가 생성되지 않는다.
+
+```python
+def sync_sku_mapping(product, sku_code_list):
+    for sku_code in sku_code_list:
+        response = fulfillment_api.put(
+            f"/skus/{sku_code}",
+            data=build_sku_payload(product, sku_code),
+        )
+        # SKU 미존재: 404 또는 커스텀 에러 코드
+        if response.status_code == 404:
+            logger.error("SKU not found in fulfillment system: %s", sku_code)
+            # 자동 재시도 없음 — 호출자가 별도로 처리해야 함
+```
+
+**빈 리스트는 skip될 수 있다**
+
+payload에 `option_list: []`처럼 빈 리스트가 전달되면 일부 구현에서는 "변경 없음"으로 해석하고 외부 API 호출 자체를 건너뛴다.
+
+```python
+def sync_options_to_fulfillment(product, option_list):
+    if not option_list:
+        return  # 빈 리스트는 skip — 재동기화 발생하지 않음
+    fulfillment_api.put(f"/products/{product.external_id}/options", data=option_list)
+```
+
+**자동 재시도가 없다**
+
+외부 API 호출이 일시적으로 실패했을 때 자동 재시도 메커니즘이 없는 구현이라면, 오류는 로그에 남지만 다음 번 관리자 저장 전까지는 복구 시도가 없다.
+
+## 트레이드오프
+
+재동기화를 "저장하면 항상 발생"하도록 구현하면 어떨까. 단순해 보이지만 다음 비용이 생긴다.
+
+| 접근 방식                | 장점                           | 단점                                                    |
+| ------------------------ | ------------------------------ | ------------------------------------------------------- |
+| 모든 저장에서 동기화     | 누락 없음, 예측 가능           | 불필요한 외부 API 호출, 부하 증가, rate limit 소진 위험 |
+| 명시적 필드 계약         | 필요한 경우에만 트리거, 효율적 | 계약을 모르면 동기화 누락을 알기 어려움                 |
+| 별도 재동기화 엔드포인트 | 명확한 의도, 독립 테스트 가능  | 운영 도구 추가 필요, 사용자 교육 필요                   |
+
+"명시적 필드 계약" 방식이 성능 면에서 효율적이지만, 이 계약이 문서화되지 않으면 운영 장애 시 원인 파악에 시간이 걸린다.
+
+## 운영 대응 체크리스트
+
+외부 이행 시스템에서 데이터 누락이 발생했을 때 확인하는 순서다.
+
+- [ ] **오류 로그에서 exception 문구로 누락 대상을 특정한다.** "SKU not found", "empty payload skipped", "fulfillment API error" 등 오류 유형마다 원인이 다르므로, 먼저 어떤 단계에서 실패했는지 파악한다.
+- [ ] **재처리할 payload가 완전한가 확인한다.** 단순 제목/이미지 수정이 아니라, `option_list` 또는 `sku_code_list`가 포함된 요청을 보내야 동기화가 트리거된다.
+- [ ] **외부 API 응답 코드를 확인한다.** HTTP 200도 내부 처리 실패를 의미하는 커스텀 에러 필드를 포함할 수 있다. 응답 body도 함께 기록되어 있는지 확인한다.
+- [ ] **부분 동기화 여부를 관찰한다.** SKU가 여러 개일 때 일부만 성공하고 나머지는 실패한 상태인지 확인한다. 재처리 시 전체를 다시 보내야 하는지 아니면 누락분만 보내도 되는지 계약을 파악한다.
+- [ ] **수동 재처리 후 외부 시스템에서 데이터가 실제로 생성됐는지 검증한다.** API 응답만 보는 것으로는 부족하다. 외부 시스템 조회 API 또는 콘솔에서 직접 확인한다.
+
+## 재동기화 경로를 테스트로 고정한다
+
+설계 교훈을 코드 수준에서 강제하는 가장 확실한 방법은 side effect 경계를 단위 테스트로 명시하는 것이다.
+
+```python
+from unittest import mock
+
+def test_update_with_option_list_triggers_sync():
+    payload = {"title": "제목", "option_list": [{"id": 1, "name": "옵션"}]}
+    with mock.patch("myapp.services.sync_options_to_fulfillment") as mock_sync:
+        update_product(product_id=1, payload=payload)
+        mock_sync.assert_called_once()
+
+def test_update_without_option_list_does_not_trigger_sync():
+    payload = {"title": "제목만 수정"}
+    with mock.patch("myapp.services.sync_options_to_fulfillment") as mock_sync:
+        update_product(product_id=1, payload=payload)
+        mock_sync.assert_not_called()
+
+def test_empty_option_list_does_not_trigger_sync():
+    payload = {"option_list": []}
+    with mock.patch("myapp.services.sync_options_to_fulfillment") as mock_sync:
+        update_product(product_id=1, payload=payload)
+        mock_sync.assert_not_called()
+```
+
+이 테스트가 없으면 "저장하면 동기화된다"는 오해가 코드 수준에서도 검증되지 않은 채 남는다. 나중에 누군가 조건문을 제거하거나 payload 구성을 바꾸어도 아무도 알아채지 못한다.
+
+## 배운 것
+
+"저장했으니 동기화됐겠지"는 API 내부 계약을 모를 때 생기는 기대다. side effect는 UI 동작이 아니라 payload 필드 계약에 의해 결정되며, 이 계약이 문서화되지 않으면 운영 장애 시 복구 경로를 찾는 데 불필요한 시간이 든다.
+
+외부 이행 시스템과 연동된 API를 설계할 때는 세 가지를 명시적으로 정의해야 한다. 어떤 필드가 동기화를 트리거하는가, idempotent PUT이라도 어떤 전제 조건이 필요한가, 실패 시 자동 재처리가 있는가 없는가. 이 세 가지가 계약으로 문서화되고 테스트로 검증되어야 운영 장애에서도 예측 가능하게 대응할 수 있다.
