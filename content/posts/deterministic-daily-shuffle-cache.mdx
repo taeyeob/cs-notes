@@ -1,0 +1,138 @@
+---
+title: "매일 바뀌지만 같은 날은 항상 같은: deterministic daily shuffle 설계"
+date: "2026-06-24"
+summary: "정적 풀에서 날짜 bucket과 SHA-256 해시로 10개를 고르면, 캐시가 날아가도 환경이 달라도 같은 날이면 같은 결과를 재현할 수 있다."
+tags:
+  - backend
+  - cache
+  - api
+  - algorithm
+---
+
+## 문제 정의
+
+콘텐츠 목록이 "오늘의 추천" 형태로 노출되어야 한다고 하자. 조건은 두 가지다.
+
+- **매일 달라야 한다.** 같은 목록이 며칠째 고정되면 추천처럼 보이지 않는다.
+- **같은 날에는 재현 가능해야 한다.** QA가 오전에 검수한 결과를 오후에도 재확인할 수 있어야 하고, 캐시가 날아가도 같은 결과가 나와야 한다.
+
+두 조건은 서로 모순처럼 보이지만, 선택 기준을 "오늘 날짜"에 묶으면 둘 다 만족할 수 있다.
+
+## 불안정한 랜덤의 문제
+
+가장 먼저 시도하는 구현은 보통 `random.sample(pool, 10)` 이다. 이것이 왜 문제인지 짚고 넘어간다.
+
+**캐시 miss마다 결과가 달라진다.** 캐시 TTL이 1시간이라면 같은 날 안에도 최대 24번 다른 목록이 나올 수 있다. QA가 특정 결과를 신고해도 재현이 안 된다.
+
+**환경 간 결과가 다르다.** dev에서 검수한 목록과 prod에서 사용자에게 노출되는 목록이 아무 관계가 없다. "stage에서 확인했다"는 말이 의미를 잃는다.
+
+**운영 설명이 불가능하다.** "오늘 왜 A가 들어갔나요?"라는 질문에 "캐시가 그때 채워질 때 랜덤으로 뽑혔습니다"는 답이 되지 않는다.
+
+## 해시 기반 deterministic shuffle
+
+해결 원리는 단순하다. 각 항목에 `seed = f(date_bucket, item_id)` 를 해시해 점수를 붙이고, 그 점수 순으로 정렬해 상위 N개를 고른다.
+
+```python
+import hashlib
+
+def daily_score(date_bucket: str, item_id: str) -> str:
+    seed = f"{date_bucket}:{item_id}"
+    return hashlib.sha256(seed.encode()).hexdigest()
+
+def pick_daily(pool: list[str], date_bucket: str, n: int = 10) -> list[str]:
+    scored = sorted(pool, key=lambda item_id: daily_score(date_bucket, item_id))
+    return scored[:n]
+```
+
+`date_bucket`은 KST 기준 날짜 문자열(예: `"2026-06-24"`)이다. 서버 타임존이 다른 환경에서 실행하더라도, bucket 계산 시 타임존을 명시하면 같은 bucket 문자열이 나온다.
+
+```python
+from datetime import datetime, timezone, timedelta
+
+KST = timezone(timedelta(hours=9))
+
+def today_bucket() -> str:
+    return datetime.now(KST).strftime("%Y-%m-%d")
+```
+
+### 왜 SHA-256인가
+
+단순히 `item_id` 문자열을 오름차순 정렬해도 결정론적이긴 하다. 그러나 그러면 선택 결과가 ID 생성 순서와 정확히 일치해 "낮은 ID가 항상 앞에 나온다"는 패턴이 노출된다. SHA-256을 통과시키면 원본 ID 순서와 무관한 해시값 오름차순이 되므로, 어떤 ID가 선택되는지 외부에서 예측하기 어렵고 날짜마다 순서도 균등하게 섞인다.
+
+### 재현성 확인
+
+같은 `date_bucket`과 `pool`이 주어지면 언제 어디서 실행해도 동일한 결과가 나온다. 캐시가 날아가도, 서버가 재시작해도, 코드를 다시 실행해도 마찬가지다. **결과를 결정하는 것은 Redis나 락이 아니라, 풀 + date bucket + 해시 규칙이다.**
+
+환경(dev / stage / prod)이 달라도 pool과 date bucket이 같으면 같은 결과가 나온다. 단, pool 내용이나 data version이 다르면 결과도 달라진다. 이 점은 아래 캐시 키 설계에서 다룬다.
+
+## 캐시 키와 데이터 버전
+
+결과가 결정론적이므로 캐시는 선택적이다. 그러나 해시 연산을 매 요청마다 반복하지 않으려면 캐싱이 필요하다.
+
+캐시 키에는 반드시 두 가지가 들어가야 한다.
+
+**date bucket.** 날짜가 바뀌면 자동으로 다른 키를 참조하게 된다.
+
+**data version(또는 pool version).** 풀 자체가 바뀌었을 때—항목이 추가되거나 제거되었을 때—이전 풀로 계산한 결과를 새 풀에 적용하면 안 된다. 버전을 키에 포함시키면 풀이 바뀌는 순간 자동으로 캐시 miss가 나고 새 풀로 재계산한다.
+
+```python
+def cache_key(date_bucket: str, pool_version: str) -> str:
+    return f"daily_picks:v1:{date_bucket}:{pool_version}"
+```
+
+`pool_version`은 풀 내용의 해시값이거나, 풀이 마지막으로 변경된 타임스탬프, 또는 명시적으로 관리하는 정수 버전 중 하나를 사용한다.
+
+### cache miss 시 동작
+
+캐시 miss가 발생해도 동일한 `date_bucket`과 동일한 `pool`이 있으면 같은 10개를 다시 계산한다. cache miss가 "오늘의 추천이 바뀐다"는 뜻이 아니다. 이 속성 덕분에 별도의 락이나 싱글턴 job 없이도 여러 서버 인스턴스가 동시에 cache를 채워도 항상 같은 값을 쓰게 된다.
+
+```python
+def get_daily_picks(pool: list[str], pool_version: str) -> list[str]:
+    bucket = today_bucket()
+    key = cache_key(bucket, pool_version)
+
+    cached = cache.get(key)
+    if cached:
+        return cached
+
+    picks = pick_daily(pool, bucket)
+    ttl = seconds_until_midnight_kst()
+    cache.set(key, picks, ex=ttl)
+    return picks
+```
+
+TTL을 자정까지 남은 초로 설정하면 날짜가 바뀌는 순간 캐시가 만료되고, 다음 요청이 새 bucket으로 재계산한다.
+
+## 검증 체크리스트
+
+- [ ] 같은 `date_bucket`과 `pool`로 두 번 실행했을 때 결과가 동일한가
+- [ ] 날짜가 바뀌면(다른 bucket) 다른 결과가 나오는가
+- [ ] 풀에서 항목이 하나 제거되면 `pool_version`이 갱신되고, 기존 캐시가 쓰이지 않는가
+- [ ] dev / stage / prod 에서 같은 날짜와 같은 풀 버전으로 실행했을 때 결과가 일치하는가
+- [ ] cache miss 후 재계산한 결과가 miss 이전과 동일한가
+- [ ] 타임존이 다른 서버에서 bucket이 KST 기준으로 통일되어 계산되는가
+- [ ] 결과 리스트의 길이가 풀 크기보다 작거나 같은 경우(풀이 N개 미만)를 처리하고 있는가
+- [ ] SHA-256 정렬 결과가 ID 오름차순과 다름을 확인했는가(패턴 노출 방지)
+
+## 트레이드오프
+
+| 항목             | 단순 random.sample            | 해시 기반 deterministic shuffle        |
+| ---------------- | ----------------------------- | -------------------------------------- |
+| 재현성           | 없음                          | 있음 (같은 bucket + pool)              |
+| 캐시 의존도      | 높음 (cache miss = 다른 결과) | 낮음 (cache miss = 재계산 = 같은 결과) |
+| 환경 간 일관성   | 없음                          | 있음 (pool version이 같으면)           |
+| 운영 설명 가능성 | 어려움                        | 쉬움 (bucket + version으로 재현)       |
+| 구현 복잡도      | 낮음                          | 낮음                                   |
+| 풀 변경 반응     | 즉시 (랜덤이므로)             | pool_version 갱신 필요                 |
+
+풀 변경이 빈번하면 `pool_version` 관리 비용이 생긴다. 풀이 정적이거나 변경 주기가 길다면 이 비용은 무시할 만한 수준이다.
+
+날짜를 넘어 여러 날의 결과를 미리 계산해 두는 것도 가능하다. `date_bucket`을 다음 날짜로 넣어 실행하면 내일의 결과를 오늘 확인할 수 있다.
+
+## 배운 것
+
+결과의 재현성을 캐시나 락으로 보장하려 하면 장애 경로가 늘어난다. 캐시가 날아가면 결과가 바뀌고, 락을 잡는 서버가 죽으면 업데이트가 안 된다.
+
+더 단단한 접근은 결과 자체를 함수로 만드는 것이다. 같은 입력(pool + date bucket)에서 항상 같은 출력이 나오면, 캐시는 성능 최적화일 뿐 정확성의 조건이 아니다. 캐시 miss는 단순히 재계산을 유발할 뿐이고, 여러 인스턴스가 동시에 채워도 같은 값이 들어간다.
+
+QA와 운영 입장에서도 이 속성은 중요하다. "오늘 날짜와 현재 pool version을 알려주면 같은 결과를 로컬에서 재현할 수 있다"는 말은, 장애 분석과 검수 프로세스 모두를 단순하게 만든다.
