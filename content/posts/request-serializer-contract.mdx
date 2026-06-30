@@ -1,0 +1,257 @@
+---
+title: "Request Serializer를 실행 가능한 API 계약으로 삼기"
+date: "2026-06-30"
+summary: "수동 Swagger 스키마는 문서일 뿐 실행되지 않는다. Request Serializer를 실제 검증 경계로 삼고, 생성 시 최소 필수값과 상태 전환 시 완전성 검증을 readiness gate로 분리하는 설계를 정리한다."
+tags:
+  - backend
+  - api
+  - django
+  - validation
+  - serializer
+---
+
+## 문제 정의
+
+관리자에서 복잡한 초안을 생성하고 나중에 노출 상태로 전환하는 API를 설계할 때, 검증 책임이 어디에 있는지 흐릿해지기 쉽다.
+
+흔한 증상은 두 가지다. 첫째, Swagger의 `required` 목록이 실제 서버 검증과 다르다. 문서에는 필수라고 적혀 있지만 빈 값으로 요청을 보내도 서버가 통과시킨다. 둘째, 초안 생성 단계에서 검증이 너무 빡빡하거나 반대로 너무 느슨해서, 노출 전환 시점에 무슨 필드가 빠졌는지 알 수 없다.
+
+두 문제의 공통 원인은 하나다. OpenAPI 스키마를 검증의 실행 경계로 쓰고 있다는 착각이다.
+
+## 위험한 패턴
+
+### 1. Swagger required는 문서일 뿐이다
+
+```python
+# OpenAPI 스펙 (YAML/decorator 방식)
+# required: [title, category_id, start_date, language]
+# → 이 선언은 SDK 생성이나 문서 렌더링에 쓰일 뿐,
+#   서버에서 실제로 is_valid()를 대신해 주지 않는다.
+
+class ItemCreateView(APIView):
+    def post(self, request):
+        # request.data를 그대로 controller에 넘기면
+        # Swagger required와 실제 검증 사이에 간극이 생긴다.
+        item = ItemService.create(request.data)
+        return Response(ItemSerializer(item).data, status=201)
+```
+
+`request.data`를 raw dict로 넘기면 필수 필드가 없어도 코드가 계속 실행된다. 오류는 ORM 레이어에서 `IntegrityError`로 터지거나, 더 나쁜 경우 `None`이 DB에 저장된다.
+
+### 2. 상태 전환을 별도 endpoint로만 처리하면 검증이 분산된다
+
+```python
+# 레거시 패턴: 상태만 바꾸는 별도 endpoint
+class ItemStatusUpdateView(APIView):
+    def patch(self, request, item_id):
+        item = get_object_or_404(Item, id=item_id)
+        item.status = request.data.get("status")
+        item.save()  # readiness 검증 없이 바로 저장
+        return Response(status=204)
+```
+
+이 endpoint가 살아 있는 한 readiness gate를 아무리 정교하게 만들어도 우회할 수 있다.
+
+## Request Serializer 계약
+
+### 생성 시 최소 필수값만 검증한다
+
+초안을 생성하는 시점에는 도메인 동작에 필요한 최소 필드만 요구한다. "나중에 채워도 되는" 필드를 생성 단계에 몰아넣으면 UX가 나빠지고 초안 저장 자체가 막힌다.
+
+```python
+class ItemCreateSerializer(serializers.Serializer):
+    title = LocalizedStringSerializer()  # nested i18n 필수
+    category_id = serializers.IntegerField()
+    start_date = serializers.DateField()
+    owner_id = serializers.IntegerField()
+    # description, images, tags 등은 선택값 — 초안에는 없어도 된다
+
+    def validate_category_id(self, value):
+        if not Category.objects.filter(id=value, is_active=True).exists():
+            raise serializers.ValidationError("유효하지 않은 카테고리입니다.")
+        return value
+```
+
+### nested i18n serializer를 공통으로 재사용한다
+
+`title.ko`와 `title.en`처럼 다국어 필드가 여러 곳에 쓰인다면, nested serializer를 하나로 만들고 재사용한다. 각 view마다 `{"ko": ..., "en": ...}` 검증을 따로 쓰면 누락이 생긴다.
+
+```python
+class LocalizedStringSerializer(serializers.Serializer):
+    ko = serializers.CharField()
+    en = serializers.CharField()
+
+    def validate(self, data):
+        # 둘 다 빈 문자열 방지
+        for lang, value in data.items():
+            if not value.strip():
+                raise serializers.ValidationError(
+                    f"{lang} 값이 비어 있습니다."
+                )
+        return data
+
+# ItemCreateSerializer, ItemUpdateSerializer 모두 동일 serializer 참조
+class ItemCreateSerializer(serializers.Serializer):
+    title = LocalizedStringSerializer()
+    ...
+```
+
+### view는 validated_data만 controller에 넘긴다
+
+```python
+class ItemCreateView(APIView):
+    def post(self, request):
+        serializer = ItemCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        # raw dict가 아니라 validated_data를 넘긴다
+        item = ItemService.create(**serializer.validated_data)
+        return Response(ItemOutputSerializer(item).data, status=201)
+```
+
+`raise_exception=True`는 검증 실패 시 `ValidationError → 400`을 자동으로 처리한다. 서비스 레이어는 이미 검증된 데이터만 받으므로 타입·필수값 방어 코드를 따로 쓰지 않아도 된다.
+
+## Readiness Gate로 검증 시점 분리
+
+초안 생성 이후, 노출·판매·예약 같은 상태로 전환하려면 더 엄격한 완전성 검증이 필요하다. 이 검증을 상태 전환 전용 serializer로 분리한다.
+
+```python
+class ItemPublishReadinessSerializer(serializers.Serializer):
+    """노출 전환 전 완전성 체크 전용 serializer."""
+
+    def validate(self, data):
+        item = self.context["item"]
+        errors = {}
+
+        if not item.title.get("ko") or not item.title.get("en"):
+            errors["title"] = "ko, en 모두 입력해야 합니다."
+        if not item.description:
+            errors["description"] = "노출 전 설명이 필요합니다."
+        if not item.images.exists():
+            errors["images"] = "이미지가 최소 1장 필요합니다."
+        if item.start_date is None:
+            errors["start_date"] = "시작일이 없습니다."
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return data
+
+
+class ItemPublishView(APIView):
+    def post(self, request, item_id):
+        item = get_object_or_404(Item, id=item_id)
+        readiness = ItemPublishReadinessSerializer(
+            data={}, context={"item": item}
+        )
+        readiness.is_valid(raise_exception=True)
+        ItemService.publish(item)
+        return Response(status=204)
+```
+
+readiness serializer는 request body를 거의 받지 않는다. 이미 저장된 item 상태를 컨텍스트로 받아 검증한다. "지금 이 item이 노출 가능한 상태인가"를 확인하는 게 목적이기 때문이다.
+
+### 레거시 상태 변경 endpoint를 수렴시킨다
+
+readiness gate를 추가했어도 레거시 `PATCH /items/{id}/status/` endpoint가 남아 있으면 우회 경로가 된다. 선택지는 두 가지다.
+
+- **제거**: 레거시 endpoint를 삭제하고 모든 상태 전환을 `POST /items/{id}/publish/` 같은 의미 있는 endpoint로 통일한다.
+- **수렴**: 삭제가 어려우면 레거시 endpoint 내부에서도 동일한 readiness serializer를 거치게 만든다.
+
+```python
+# 수렴 방식 — 레거시 endpoint를 남겨야 할 때
+class ItemStatusUpdateView(APIView):
+    STATUS_VALIDATORS = {
+        "published": ItemPublishReadinessSerializer,
+        "on_sale": ItemSaleReadinessSerializer,
+    }
+
+    def patch(self, request, item_id):
+        item = get_object_or_404(Item, id=item_id)
+        new_status = request.data.get("status")
+        validator_cls = self.STATUS_VALIDATORS.get(new_status)
+        if validator_cls:
+            validator = validator_cls(data={}, context={"item": item})
+            validator.is_valid(raise_exception=True)
+        ItemService.change_status(item, new_status)
+        return Response(status=204)
+```
+
+어느 경로로 들어오든 같은 검증 코드를 거치면 우회가 없다.
+
+## 테스트 전략
+
+세 가지 축을 커버한다.
+
+### 1. 필수값 누락 시 400
+
+```python
+def test_title_누락_시_400(self):
+    payload = {"category_id": 1, "start_date": "2026-07-01", "owner_id": 2}
+    response = self.client.post("/items/", data=payload)
+    assert response.status_code == 400
+    assert "title" in response.data
+
+def test_title_ko_누락_시_400(self):
+    payload = {
+        "title": {"en": "Event"},  # ko 없음
+        "category_id": 1,
+        "start_date": "2026-07-01",
+        "owner_id": 2,
+    }
+    response = self.client.post("/items/", data=payload)
+    assert response.status_code == 400
+    assert "title" in response.data
+```
+
+### 2. 상태 전환 시 누락 필드 반환
+
+```python
+def test_이미지_없는_item_노출전환_시_400(self):
+    item = ItemFactory(status="draft")
+    # images 없음, description 없음
+    response = self.client.post(f"/items/{item.id}/publish/")
+    assert response.status_code == 400
+    assert "images" in response.data
+    assert "description" in response.data
+
+def test_readiness_통과한_item은_노출전환_성공(self):
+    item = ItemFactory(
+        status="draft",
+        description="충분한 설명",
+        images=[ImageFactory()],
+    )
+    response = self.client.post(f"/items/{item.id}/publish/")
+    assert response.status_code == 204
+    item.refresh_from_db()
+    assert item.status == "published"
+```
+
+### 3. 문서와 실행 검증 불일치 방지
+
+Swagger `required` 목록을 소스로 삼지 말고, serializer의 required field 목록을 테스트에서 직접 단언한다.
+
+```python
+def test_create_serializer_required_fields(self):
+    serializer = ItemCreateSerializer(data={})
+    serializer.is_valid()
+    required = set(serializer.errors.keys())
+    # 필수 필드가 늘거나 줄면 이 테스트가 먼저 깨진다
+    assert required == {"title", "category_id", "start_date", "owner_id"}
+```
+
+이 테스트가 있으면 누군가 serializer에서 `required=False`를 붙이거나 필드를 추가했을 때 의도를 확인하게 된다.
+
+## 트레이드오프
+
+readiness gate를 분리하면 초안 생성이 느슨해진다. 불완전한 초안이 DB에 많이 생길 수 있고, 관리 화면에서 "완성되지 않은 항목" 수가 늘어 보일 수 있다.
+
+이 설계는 다음 전제를 깔고 있다. "관리자가 여러 단계에 걸쳐 초안을 완성하는 흐름이 일반적이다." 생성 단계에서 모든 필드를 강제하면 일부만 채워진 상태로 저장하지 못하고, 작업 흐름이 강제로 단일 세션에 묶인다.
+
+반대로 모든 전환 경로가 단순하고 생성과 노출이 한 번에 이루어지는 도메인이라면, 생성 serializer와 readiness serializer를 굳이 분리할 이유가 없다. 분리는 생성과 완성 시점이 다를 때 가치를 낸다.
+
+## 배운 것
+
+OpenAPI `required` 선언과 실제 서버 검증은 동기화를 보장하는 메커니즘이 없다. 문서는 항상 실행보다 늦게 낡는다. 실행 경계를 Request Serializer에 두고, Swagger는 그 serializer에서 자동 생성하는 방향이 안전하다.
+
+검증 시점은 두 개다. 첫째, 생성 시 도메인 동작에 필요한 최소 필수값. 둘째, 상태 전환 시 노출 가능한 완전성. 이 둘을 하나의 serializer로 합치면 생성이 막히거나 전환이 느슨해진다. 분리하면 각 시점에 맞는 오류 메시지를 줄 수 있고, 테스트도 명확해진다.
+
+레거시 endpoint는 남아 있는 순간 게이트가 된다. 삭제하거나 같은 검증 경로로 수렴시키는 것이, 새로 만든 readiness gate를 의미 있게 만드는 마지막 단계다.
