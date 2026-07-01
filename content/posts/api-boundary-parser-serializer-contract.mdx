@@ -1,0 +1,233 @@
+---
+title: "API 경계에서 파서·시리얼라이저·컨트롤러 책임을 분리하는 법"
+date: "2026-07-01"
+summary: "외부 camelCase JSON을 받아 내부 snake_case로 전달하는 과정에서 파서, DRF Serializer, 컨트롤러 각 계층이 무엇을 책임져야 하는지, 리소스 경로 소유권을 잘못 부여하면 어떤 문제가 생기는지 정리한다."
+tags:
+  - backend
+  - api
+  - django
+  - drf
+  - design
+---
+
+## 문제 정의
+
+Django REST Framework로 상태 변경 API를 설계할 때 두 가지 혼란이 동시에 발생하는 경우가 있다.
+
+첫째, 액션(action)이 잘못된 리소스 경로에 붙는다. 예를 들어 캠페인 이벤트(`CampaignEvent`)의 상태를 변경하는 엔드포인트가 `/campaigns/{id}/update_status/`처럼 부모 리소스 경로에 달려 있는 경우다. URL만 보면 어떤 리소스의 상태를 바꾸는지 명확하지 않다.
+
+둘째, 요청 검증 책임이 view 안에 분산된다. `request.data["saleStatus"]`처럼 raw dict에 직접 접근하거나, camelCase와 snake_case 키를 동시에 허용하는 fallback 코드가 view 레이어에 섞인다.
+
+두 문제는 독립적으로 보이지만 같은 근원에서 온다. 파서, 시리얼라이저, 컨트롤러 각 계층의 책임이 명시적으로 정해지지 않은 것이다.
+
+## 위험한 구현 패턴
+
+### 패턴 1: 잘못된 리소스 경로에 상태 변경 액션이 붙는다
+
+```python
+# 위험: CampaignEvent 상태를 변경하는데 /campaigns/{id}/ 경로 사용
+class CampaignViewSet(viewsets.ModelViewSet):
+    @action(detail=True, methods=["patch"], url_path="update_sale_status")
+    def update_sale_status(self, request, pk=None):
+        # pk가 Campaign id인지 CampaignEvent id인지 불분명
+        event = CampaignEvent.objects.get(campaign_id=pk)
+        event.sale_status = request.data.get("saleStatus")
+        event.save()
+        return Response({"result": "ok"})
+```
+
+이 패턴의 문제는 두 가지다. 첫째, `pk`가 `Campaign`을 가리키는지 `CampaignEvent`를 가리키는지 경로만 봐서는 알 수 없다. 둘째, `CampaignEvent`가 여러 개일 때 어떤 이벤트의 상태가 바뀌는지 계약에 없다.
+
+### 패턴 2: 파서와 view가 케이스 변환을 함께 담당한다
+
+```python
+# 위험: view에서 camelCase / snake_case 동시 허용
+def update_sale_status(self, request, pk=None):
+    sale_status = (
+        request.data.get("saleStatus")
+        or request.data.get("sale_status")  # fallback
+    )
+    display_status = (
+        request.data.get("displayStatus")
+        or request.data.get("display_status")
+    )
+    # 어느 키가 실제로 들어왔는지 보장되지 않음
+```
+
+파서 단에서 변환이 이미 됐는지, view 단에서 처리해야 하는지 계약이 없으면 누군가 파서를 제거하거나 교체할 때 이 fallback 코드가 silent bug를 만든다.
+
+### 패턴 3: raw `request.data`가 컨트롤러까지 그대로 흐른다
+
+```python
+# 위험: 검증 없이 dict를 직접 controller에 넘김
+def update_sale_status(self, request, pk=None):
+    result = CampaignEventController.update_status(
+        event_id=pk,
+        payload=request.data,   # 타입, 필드 존재 여부, 값 범위 검증 없음
+    )
+```
+
+컨트롤러가 `payload["sale_status"]`에 접근할 때 `KeyError`가 발생하거나, 유효하지 않은 값이 그대로 DB에 저장된다.
+
+## 안전한 경계 설계
+
+### 계층별 단일 책임
+
+```
+외부 요청(camelCase JSON)
+    ↓  CamelCaseJSONParser
+내부 dict(snake_case)
+    ↓  DRF Serializer (검증·타입 변환)
+validated_data(snake_case, 타입 보장)
+    ↓  View → Controller
+비즈니스 로직
+```
+
+각 계층의 책임은 명확하게 나뉜다.
+
+- **파서**: 외부 케이스를 내부 케이스로 변환. camelCase → snake_case. 이 책임을 view나 serializer에 두지 않는다.
+- **Serializer**: 필드 존재 여부, 타입, 값 범위 검증. `is_valid(raise_exception=True)` 이후 `validated_data`는 계약이 보장된 dict다.
+- **View**: Serializer 실행 후 `validated_data`를 컨트롤러에 넘기는 얇은 라우터 역할.
+- **Controller**: 검증 완료된 snake_case 인자만 받는다. 케이스 변환이나 입력 검증 코드가 없어야 한다.
+
+### 리소스 경로 소유권을 액션 대상으로 맞춘다
+
+```python
+# 안전: 하위 이벤트 리소스에 상태 변경 액션을 붙인다
+class CampaignEventViewSet(viewsets.GenericViewSet):
+    queryset = CampaignEvent.objects.all()
+
+    @action(detail=True, methods=["patch"], url_path="update_sale_status")
+    def update_sale_status(self, request, pk=None):
+        # pk가 CampaignEvent.id임이 경로에서 명확
+        event = self.get_object()   # 404 자동 처리
+        serializer = SaleStatusUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        updated = CampaignEventController.update_sale_status(
+            event=event,
+            **serializer.validated_data,   # snake_case 보장
+        )
+        return Response(CampaignEventSerializer(updated).data)
+```
+
+`/events/{id}/update_sale_status/` 경로에서 `id`가 `CampaignEvent`를 가리킨다는 것이 URL 구조만으로 명확해진다. 또한 `self.get_object()`가 `pk`를 기반으로 404를 자동 반환하므로 "잘못된 부모 리소스 경로에 접근해도 상태가 변경되는" 문제가 구조적으로 막힌다.
+
+### Serializer에 검증 책임을 집중한다
+
+```python
+from rest_framework import serializers
+
+class SaleStatusUpdateSerializer(serializers.Serializer):
+    sale_status = serializers.ChoiceField(choices=["on_sale", "paused", "closed"])
+    display_status = serializers.ChoiceField(
+        choices=["visible", "hidden"],
+        required=False,
+    )
+    # camelCase 허용 코드 없음
+    # CamelCaseJSONParser가 이미 변환해서 들어옴
+```
+
+`CamelCaseJSONParser`가 전역 또는 view 레벨에 등록되어 있으면, serializer field는 snake_case만 선언한다. `saleStatus`를 별도로 처리하는 코드가 serializer 안에 있어선 안 된다.
+
+### Swagger 문서도 Serializer에서 생성한다
+
+```python
+from drf_yasg.utils import swagger_auto_schema
+
+class CampaignEventViewSet(viewsets.GenericViewSet):
+    @swagger_auto_schema(request_body=SaleStatusUpdateSerializer)
+    @action(detail=True, methods=["patch"], url_path="update_sale_status")
+    def update_sale_status(self, request, pk=None):
+        ...
+```
+
+`openapi.Schema`를 수동으로 작성하면 Serializer 변경과 문서가 따로 돌아간다. `request_body=SaleStatusUpdateSerializer`를 쓰면 필드 정의가 단일 소스에서 유지된다.
+
+## 테스트 전략
+
+검증해야 하는 경계는 네 가지다.
+
+```python
+import pytest
+from rest_framework.test import APIClient
+
+@pytest.fixture
+def client():
+    return APIClient()
+
+# 1. 외부 camelCase payload가 정상 처리된다
+def test_camel_case_payload_accepted(client, event):
+    response = client.patch(
+        f"/api/events/{event.id}/update_sale_status/",
+        data={"saleStatus": "paused"},   # CamelCaseJSONParser 통과
+        format="json",
+    )
+    assert response.status_code == 200
+    event.refresh_from_db()
+    assert event.sale_status == "paused"
+
+# 2. 내부 컨트롤러는 snake_case validated_data만 받는다
+def test_controller_receives_snake_case(mocker, event):
+    mock_ctrl = mocker.patch(
+        "myapp.controllers.CampaignEventController.update_sale_status",
+        return_value=event,
+    )
+    client = APIClient()
+    client.patch(
+        f"/api/events/{event.id}/update_sale_status/",
+        data={"saleStatus": "closed"},
+        format="json",
+    )
+    call_kwargs = mock_ctrl.call_args.kwargs
+    assert "sale_status" in call_kwargs
+    assert "saleStatus" not in call_kwargs
+
+# 3. 잘못된 부모 리소스 경로는 상태를 변경하지 않는다
+def test_parent_path_does_not_change_event_status(client, campaign, event):
+    original_status = event.sale_status
+    response = client.patch(
+        f"/api/campaigns/{campaign.id}/update_sale_status/",
+        data={"saleStatus": "closed"},
+        format="json",
+    )
+    # 경로 자체가 존재하지 않아야 함
+    assert response.status_code == 404
+    event.refresh_from_db()
+    assert event.sale_status == original_status
+
+# 4. 필수 필드 누락 / 허용되지 않은 값은 400 반환
+def test_missing_body_returns_400(client, event):
+    response = client.patch(
+        f"/api/events/{event.id}/update_sale_status/",
+        data={},
+        format="json",
+    )
+    assert response.status_code == 400
+
+def test_invalid_status_value_returns_400(client, event):
+    response = client.patch(
+        f"/api/events/{event.id}/update_sale_status/",
+        data={"saleStatus": "unknown_value"},
+        format="json",
+    )
+    assert response.status_code == 400
+```
+
+테스트 3번이 핵심이다. 잘못된 리소스 경로에 액션이 붙어 있으면 이 테스트가 실패하고, 올바른 경로로 옮겨야 통과한다.
+
+## 트레이드오프
+
+- **CamelCaseJSONParser 전역 적용**: view·serializer가 케이스 변환을 몰라도 된다는 장점이 있다. 반면 파서 설정이 누락되면 silent 오류가 발생하고 명시적 의존성이 없다.
+- **Serializer에 검증 집중**: 컨트롤러 진입 전 타입·값 범위를 보장할 수 있다. 경량 엔드포인트에는 boilerplate가 늘어나는 단점이 있다.
+- **리소스 경로와 액션 대상 일치**: URL만 보고 어떤 데이터가 바뀌는지 명확해진다. ViewSet 수가 늘어나고 라우터 설정 관리가 필요하다.
+- **`request_body=Serializer` 방식**: Swagger 문서와 구현이 자동으로 동기화된다. serializer에 없는 예시나 커스텀 설명을 추가하기 어렵다.
+
+파서를 전역으로 설정했다면 이를 README나 설정 파일 주석에 명시해야 한다. "camelCase를 보내도 되는 이유"가 코드에서 추론 가능하지 않으면 새 기여자가 직접 fallback 코드를 추가하는 실수를 반복한다.
+
+## 배운 것
+
+리소스 경로 소유권과 계층 간 케이스 변환 책임은 따로 보이지만, 둘 다 "누가 무엇을 알아야 하는가"라는 같은 문제다.
+
+경로 소유권이 잘못 설정되면 URL에서 어떤 데이터가 변경되는지 파악하기 위해 코드를 따라가야 한다. 케이스 변환 책임이 분산되면 파서, view, serializer, 컨트롤러 중 어느 층에서 변환이 일어났는지 추적해야 한다.
+
+두 문제 모두 계약을 묵시적으로 두는 데서 온다. 해결 방향은 같다. 파서는 외부 케이스를 변환하고, serializer는 타입과 값 범위를 검증하고, view는 `validated_data`만 전달하고, 컨트롤러는 검증 완료된 인자만 받는다. 이 네 계층의 경계를 명시하고 테스트로 고정하면, 각 층은 자신이 책임지는 일만 한다.
