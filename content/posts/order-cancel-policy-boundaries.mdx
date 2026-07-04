@@ -1,0 +1,204 @@
+---
+title: "주문 취소 가능 여부를 두 개의 정책으로 분리해야 하는 이유"
+date: "2026-07-04"
+summary: "취소 버튼 표시 여부를 결정하는 표시 정책과 취소 명령이 실제로 성공하는 실행 정책을 혼용하면 UI는 취소 가능이라고 보여주면서 API는 거절하는 불일치가 생긴다. 두 정책의 입력과 경계를 명시적으로 나누는 설계 접근을 정리한다."
+tags:
+  - backend
+  - order
+  - consistency
+  - design
+---
+
+## 문제 정의
+
+주문 취소 기능을 분석하다 보면 코드 안에 두 가지 다른 질문이 뒤섞여 있는 경우를 자주 만난다.
+
+- **"취소 버튼을 보여줄 것인가?"** — UI가 사용자에게 취소 옵션을 제공하는 표시 결정
+- **"취소 명령이 실제로 성공할 것인가?"** — 백엔드 실행 경로가 요청을 처리하는 실행 결정
+
+두 질문의 답이 항상 일치하면 문제가 없다. 하지만 실제 코드에서는 각 경로가 서로 다른 입력을 보고 서로 다른 기준으로 판단한다. 결과적으로 UI는 "취소 가능"을 표시하지만 취소 API를 호출하면 실패하는 상황이 만들어진다.
+
+이 불일치가 발생하는 지점은 세 군데다.
+
+1. **상태 범위**: 실행 경로가 허용하는 주문 상태 집합과 표시 경로가 허용하는 상태 집합이 다르다.
+2. **데이터 소스**: 실행 경로는 주문 시점에 저장된 스냅샷을 보고, 표시 경로는 현재 상품 메타데이터를 본다.
+3. **시간 조건**: 실행 경로는 판매 종료 시각 같은 외부 조건을 반영하지만 표시 경로는 그렇지 않거나, 반대 방향의 불일치가 생긴다.
+
+## 왜 어긋나는가
+
+### 허용 상태 집합의 불일치
+
+실행 경로는 실제로 취소 처리가 가능한 상태만 허용한다. 예를 들어 결제 완료와 재고 확인 중 상태에 있는 주문만 취소 로직을 실행한다.
+
+```python
+CANCELABLE_EXEC_STATUSES = {"PAYMENT_COMPLETED", "INVENTORY_CHECKING"}
+
+def cancel_order(order_id):
+    order = Order.objects.get(id=order_id)
+    if order.status not in CANCELABLE_EXEC_STATUSES:
+        raise OrderNotCancelableError(f"status={order.status}")
+    # ... 취소 처리
+```
+
+표시 경로는 UI에서 취소 버튼을 언제 보여줄지 결정한다. 이 경로는 "아직 처리 전이면 대부분 취소 가능하지 않을까"라는 넓은 기준으로 작성되는 경향이 있다.
+
+```python
+CANCELABLE_DISPLAY_STATUSES = {
+    "PAYMENT_COMPLETED", "INVENTORY_CHECKING",
+    "PREPARING", "SHIPPING_READY",  # 실행 경로는 허용하지 않는 상태
+}
+
+def is_cancelable_for_display(order):
+    return order.status in CANCELABLE_DISPLAY_STATUSES
+```
+
+이 두 집합이 다르면 `PREPARING` 상태 주문에서 취소 버튼이 보이지만 API를 호출하면 거절된다.
+
+### 스냅샷 vs. 현재 메타데이터
+
+실행 경로는 주문 시점에 저장된 환불 가능 여부 스냅샷을 기준으로 판단하는 경우가 많다.
+
+```python
+def cancel_order(order_id):
+    order = Order.objects.get(id=order_id)
+    ordered_items = order.ordered_data  # 주문 시점 저장 스냅샷
+    for item in ordered_items:
+        if not item["is_refundable"]:  # 주문 당시 기록된 값
+            raise RefundNotAllowedError(item["product_id"])
+    # ...
+```
+
+표시 경로는 현재 상품 DB에서 환불 정책을 조회하는 경우가 있다.
+
+```python
+def is_cancelable_for_display(order):
+    product_ids = [item.product_id for item in order.items.all()]
+    products = Product.objects.filter(id__in=product_ids)
+    return all(p.refund_policy == "ALLOWED" for p in products)
+```
+
+상품 환불 정책이 주문 이후에 바뀌면 두 경로의 판단이 달라진다. 주문 당시에는 환불 불가였지만 현재 DB는 환불 허용으로 바뀐 경우, 표시 경로는 취소 가능을 보여주고 실행 경로는 거절한다. 반대 방향도 발생한다.
+
+### 시간 조건 누락
+
+이벤트성 상품이나 펀딩형 주문은 판매 기간이 끝나면 취소가 불가능해지는 경우가 있다. 실행 경로는 이 조건을 검사하지만, 표시 경로에서 같은 조건을 함께 검사하지 않으면 마감 이후에도 취소 버튼이 남아 있다.
+
+```python
+def cancel_order(order_id):
+    order = Order.objects.get(id=order_id)
+    if order.order_type == "EVENT" and order.sales_end_at < now():
+        raise CancelWindowClosedError()
+    # ...
+
+def is_cancelable_for_display(order):
+    # 시간 조건 없음 — sales_end_at 이후에도 취소 버튼 표시
+    return order.status in CANCELABLE_DISPLAY_STATUSES
+```
+
+### 결제 수단 제한
+
+특정 결제 수단(예: 가상계좌)은 직접 취소 흐름이 불가능하고 별도 절차를 거쳐야 하는 경우가 있다. 실행 경로는 이 조건을 막지만 표시 경로가 결제 수단을 보지 않으면 취소 버튼이 그대로 노출된다.
+
+## 설계 접근
+
+두 정책을 명시적으로 분리하고 각각의 입력과 반환 이유를 명확히 정의한다.
+
+```python
+# 실행 정책: 취소 명령이 성공하기 위한 조건 전부
+def check_cancel_executable(order) -> None:
+    """조건을 통과하지 못하면 예외를 올린다."""
+    if order.status not in CANCELABLE_EXEC_STATUSES:
+        raise OrderNotCancelableError(status=order.status)
+
+    if order.order_type == "EVENT" and order.sales_end_at < now():
+        raise CancelWindowClosedError()
+
+    if order.payment_method == "VIRTUAL_ACCOUNT":
+        raise DirectCancelNotSupportedError(method=order.payment_method)
+
+    for item in order.ordered_data:
+        if not item["is_refundable"]:
+            raise RefundNotAllowedError(product_id=item["product_id"])
+
+
+# 표시 정책: UI에서 취소 옵션을 보여줄 조건
+def is_cancelable_display(order) -> bool:
+    """실행 정책과 동일한 조건을 평가하되, 예외 대신 bool을 반환한다."""
+    if order.status not in CANCELABLE_EXEC_STATUSES:
+        return False
+
+    if order.order_type == "EVENT" and order.sales_end_at < now():
+        return False
+
+    if order.payment_method == "VIRTUAL_ACCOUNT":
+        return False
+
+    return all(item["is_refundable"] for item in order.ordered_data)
+```
+
+이 구조의 핵심은 표시 정책이 실행 정책과 동일한 조건 집합을 평가한다는 점이다. 실행 정책의 조건이 추가되면 표시 정책도 같이 갱신된다. 두 함수가 독립적인 조건 목록을 관리하면 조건이 추가될 때 한쪽만 반영하는 실수가 생긴다.
+
+### 조건을 명시적 이유로 표현하기
+
+디버깅과 테스트를 위해 표시 불가 이유를 구조화해서 반환하는 방식도 유용하다.
+
+```python
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class CancelabilityResult:
+    cancelable: bool
+    reason: Optional[str] = None  # 불가 사유 식별자
+
+def check_cancelability(order) -> CancelabilityResult:
+    if order.status not in CANCELABLE_EXEC_STATUSES:
+        return CancelabilityResult(False, "INVALID_STATUS")
+
+    if order.order_type == "EVENT" and order.sales_end_at < now():
+        return CancelabilityResult(False, "SALES_ENDED")
+
+    if order.payment_method == "VIRTUAL_ACCOUNT":
+        return CancelabilityResult(False, "UNSUPPORTED_PAYMENT_METHOD")
+
+    if not all(item["is_refundable"] for item in order.ordered_data):
+        return CancelabilityResult(False, "NON_REFUNDABLE_ITEM")
+
+    return CancelabilityResult(True)
+```
+
+실행 경로는 이 결과를 보고 예외를 올리고, 표시 경로는 `cancelable` 필드만 읽는다. 로그에 `reason`이 남으면 "왜 취소 버튼이 안 보이는가"를 추적할 수 있다.
+
+## 트레이드오프
+
+### 스냅샷 vs. 현재 메타데이터
+
+스냅샷 기반 실행 정책은 주문 당시 계약 조건에 따라 판단하므로 상품 정책 변경에 영향을 받지 않는다. 고객 입장에서는 주문한 시점의 약속이 지켜지는 것이므로 일관성이 있다. 반면 현재 메타데이터 기반 표시 정책은 최신 상태를 반영하지만, 실행 정책과 입력이 달라져 불일치가 생긴다.
+
+두 정책이 같은 데이터 소스를 봐야 한다면 표시 정책도 스냅샷을 기준으로 조정하는 것이 단순하다. 현재 상품 정책을 반영하고 싶다면 실행 정책도 동일하게 변경해야 한다.
+
+### 표시 정책을 엄격하게 vs. 느슨하게
+
+표시 정책을 실행 정책보다 더 좁게 잡으면(더 많은 경우에 취소 버튼을 숨기면) 사용자가 취소 가능한 상황에서도 버튼을 못 보는 경우가 생긴다. 반대로 느슨하게 잡으면 버튼을 눌렀을 때 API가 거절하는 경우가 생긴다.
+
+어느 쪽을 선택하든 의도된 선택이어야 한다. 버튼을 눌렀을 때 실패 메시지를 보여주는 UX와, 버튼 자체를 숨기는 UX는 사용자 경험이 다르다.
+
+## 검증 방법
+
+코드 리뷰와 테스트에서 확인할 체크리스트다.
+
+- [ ] 실행 정책과 표시 정책이 평가하는 조건 목록이 동일한가. 한쪽에만 있는 조건이 있다면 의도된 차이인가
+- [ ] 실행 정책에 새 조건을 추가했을 때 표시 정책도 같이 변경됐는가
+- [ ] 스냅샷을 기준으로 판단하는 조건은 어느 쪽이고, 현재 DB를 보는 조건은 어느 쪽인가. 두 입력이 섞여 있지 않은가
+- [ ] 시간 조건(판매 종료 시각 등)이 실행 경로와 표시 경로 양쪽에 모두 반영됐는가
+- [ ] 결제 수단별 제한이 표시 경로에도 반영됐는가
+- [ ] 취소 불가 이유가 로그에 남는가. 운영 중에 "왜 취소가 안 됐는가"를 코드 없이 파악할 수 있는가
+- [ ] 표시 가능 + 실행 불가, 표시 불가 + 실행 가능 케이스를 각각 테스트했는가
+
+## 배운 것
+
+취소 가능 여부를 하나의 함수나 하나의 상태 집합으로 관리하고 싶은 욕구는 자연스럽다. 그러나 "보여줄 것인가"와 "성공할 것인가"는 목적이 다르고 입력도 다르다. 이 두 질문을 같은 코드로 대답하려는 순간, 한쪽 조건을 변경할 때 다른 쪽에 영향을 주는 구조가 된다.
+
+명시적으로 분리하면 각 정책의 조건 목록이 코드에서 드러난다. 리뷰할 때 "실행 정책에 이 조건이 있는데 표시 정책에는 없다"는 불일치가 눈에 보인다. 조건을 추가할 때도 두 곳을 같이 봐야 한다는 사실이 구조에서 암시된다.
+
+표시 정책이 실행 정책의 결과를 완전히 예측하지 못하는 경우가 생기더라도, 두 정책 중 어느 쪽이 보수적인지는 명시적으로 결정해야 한다. 묵시적으로 느슨한 표시 정책이 남아 있으면, 사용자가 버튼을 눌렀을 때 처음 보는 오류가 유일한 신호가 된다.
