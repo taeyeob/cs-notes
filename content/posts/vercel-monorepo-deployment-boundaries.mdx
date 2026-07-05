@@ -1,0 +1,158 @@
+---
+title: "모노레포에서 Vercel 프로젝트 경계를 나누는 법"
+date: "2026-07-05"
+summary: "Next.js 프론트엔드와 FastAPI 백엔드를 같은 저장소에 두면서 Vercel 배포는 분리하는 경우, 프로젝트 루트 설정과 환경 변수 계약, 업스트림 중복 작업 충돌을 어떻게 처리하는지 정리한다."
+tags:
+  - deployment
+  - vercel
+  - nextjs
+  - fastapi
+  - monorepo
+---
+
+## 문제 정의
+
+프론트엔드와 백엔드를 하나의 저장소에서 관리하고 싶지만, 두 서비스를 같은 Vercel 프로젝트로 묶으면 배포 단위와 환경 변수 범위가 뒤섞인다. 그렇다고 저장소를 두 개로 분리하면 공유 타입이나 설정 파일 관리 비용이 늘어난다.
+
+핵심 질문은 "백엔드를 별도 저장소로 분리해야 하는가"가 아니라, "같은 저장소 안에서 배포 경계를 어떻게 선으로 긋는가"다. 저장소 분리는 필수가 아니다. Vercel은 프로젝트별로 루트 디렉터리를 독립적으로 지정할 수 있으므로, 하나의 저장소에서 두 개의 독립 배포 단위를 유지할 수 있다.
+
+## 목표 구조
+
+```
+repo-root/
+├── apps/
+│   └── web/          ← Next.js 프론트엔드 (Vercel 프로젝트 A)
+├── services/
+│   └── api/          ← FastAPI 백엔드 (Vercel 프로젝트 B)
+└── ...
+```
+
+Vercel 프로젝트 A는 루트 디렉터리를 `apps/web`으로 설정하고, 프로젝트 B는 `services/api`로 설정한다. 두 프로젝트는 같은 GitHub 저장소를 가리키지만 서로 독립적으로 빌드·배포된다.
+
+## 구성 경계
+
+### 1. Vercel 프로젝트 루트 분리
+
+각 Vercel 프로젝트의 **Root Directory** 설정이 핵심이다. 루트가 분리되면 빌드 명령, 출력 디렉터리, 환경 변수가 각 프로젝트 범위 안으로 국한된다.
+
+| 항목           | 프론트엔드 (apps/web) | 백엔드 (services/api)         |
+| -------------- | --------------------- | ----------------------------- |
+| Root Directory | `apps/web`            | `services/api`                |
+| Build Command  | `next build`          | 필요 시 직접 지정 또는 기본값 |
+| Output Dir     | `.next`               | FastAPI는 빌드 결과물 없음    |
+| 환경 변수 범위 | 프론트엔드 전용       | 백엔드 전용                   |
+
+### 2. API Base URL 계약
+
+프론트엔드는 백엔드 엔드포인트를 직접 하드코딩하지 않는다. `NEXT_PUBLIC_API_BASE_URL` 환경 변수를 통해 런타임에 주입한다.
+
+```typescript
+// apps/web/lib/api.ts
+const BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL;
+
+export async function fetchItems() {
+  const res = await fetch(`${BASE_URL}/items`);
+  if (!res.ok) throw new Error("fetch failed");
+  return res.json();
+}
+```
+
+Vercel 프론트엔드 프로젝트의 환경 변수 설정에서 Preview와 Production 각각에 올바른 백엔드 URL을 지정한다. Preview 환경에서 Preview 백엔드를 바라보도록 명시적으로 연결하지 않으면, Preview 프론트엔드가 Production 백엔드를 호출하는 상황이 생긴다.
+
+```
+# Vercel 프론트엔드 프로젝트 환경 변수 (예시)
+# Production
+NEXT_PUBLIC_API_BASE_URL=https://api.example.com
+
+# Preview
+NEXT_PUBLIC_API_BASE_URL=https://api-preview.example.com
+```
+
+`NEXT_PUBLIC_` 접두사가 붙은 변수는 클라이언트 번들에 인라인된다. 빌드 시점에 값이 결정되므로 배포 이후 환경 변수를 바꿔도 재빌드하지 않으면 반영되지 않는다.
+
+### 3. CORS와 WEB_ORIGIN
+
+백엔드는 프론트엔드의 출처(origin)를 환경 변수로 받아서 CORS 허용 목록을 구성한다.
+
+```python
+# services/api/main.py
+import os
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+allowed_origins = os.environ.get("WEB_ORIGIN", "").split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+Vercel 백엔드 프로젝트에서 `WEB_ORIGIN`을 프론트엔드 배포 URL로 설정하면, 환경마다 별도 코드 변경 없이 CORS가 해당 환경에만 열린다. Preview 브랜치의 프론트엔드 URL은 매 배포마다 달라지므로, 고정된 Preview 도메인 패턴이나 별도 환경을 사용하는 편이 관리하기 쉽다.
+
+## 업스트림 중복 작업 처리
+
+모노레포에서 같은 기능을 여러 브랜치에서 동시에 작업하면 충돌이 생긴다. 예를 들어 스트리밍(SSE) 지원을 로컬에서 구현 중인데, 업스트림 `main`에 같은 기능이 먼저 병합된 경우 두 구현이 겹친다.
+
+이 상황의 원칙은 **업스트림 버전을 우선한다**는 것이다. 로컬 구현을 제거하고 업스트림에서 최신을 받아오는 것이 기술 부채와 병합 충돌을 모두 줄이는 가장 빠른 경로다.
+
+```bash
+# 로컬 브랜치를 main 최신 상태 위에 다시 올린다
+git fetch origin
+git rebase origin/main
+
+# 겹치는 로컬 변경은 rebase 과정에서 제거하거나 업스트림 버전으로 교체
+```
+
+충돌 해소 시 로컬 구현을 업스트림 것으로 대체하는 선택이 어려운 이유는 자신의 작업을 버리는 느낌이 들기 때문이다. 그러나 업스트림이 이미 review를 통과하고 테스트까지 완료된 상태라면, 로컬 버전을 고집하는 것보다 업스트림 버전을 신뢰하는 편이 합리적이다.
+
+## 배포 후 검증
+
+Vercel 배포가 완료되었다고 해서 서비스가 정상 동작한다고 볼 수 없다. 빌드 성공과 런타임 정상 작동은 별개다. 배포 직후 다음 항목을 순서대로 확인한다.
+
+### 기본 연결 확인
+
+```bash
+# 1. 백엔드 헬스 확인
+curl https://api.example.com/health
+
+# 2. 프론트엔드가 백엔드 API를 실제로 호출하는지 확인
+#    (브라우저 DevTools → Network 탭에서 NEXT_PUBLIC_API_BASE_URL이 올바른지)
+
+# 3. 정적 에셋이 정상 로드되는지 확인
+#    (이미지, 폰트 등이 404 없이 반환되는지)
+```
+
+### 검증 체크리스트
+
+- [ ] 백엔드 헬스 엔드포인트(`/health` 또는 `/`)가 200을 반환하는가
+- [ ] 프론트엔드가 올바른 백엔드 URL을 바라보는가 (Preview → Preview, Production → Production)
+- [ ] 실제 데이터 조회 API 호출이 브라우저에서 성공하는가 (CORS 오류 없음)
+- [ ] 정적 이미지 에셋이 정상 로드되는가 (Next.js `public/` 디렉터리 경로 확인)
+- [ ] 환경 변수 누락으로 인한 빌드 경고나 런타임 `undefined` 값이 없는가
+- [ ] Vercel 빌드 로그에 의도하지 않은 디렉터리 파일이 포함되지 않았는가 (루트 설정 오류 감지)
+
+## 트레이드오프
+
+| 구성 방식                          | 장점                                      | 단점                                                                 |
+| ---------------------------------- | ----------------------------------------- | -------------------------------------------------------------------- |
+| 모노레포 + Vercel 프로젝트 분리    | 코드 공유 용이, 단일 PR로 full-stack 변경 | 프로젝트 설정 두 곳 관리, Preview URL 연동 주의 필요                 |
+| 저장소 분리 + Vercel 프로젝트 분리 | 배포 경계가 명확                          | 공유 타입·설정 관리 비용, 교차 PR 추적 어려움                        |
+| 모노레포 + 단일 Vercel 프로젝트    | 설정 단순                                 | FastAPI와 Next.js를 한 루트에서 빌드하기 어려움, 환경 변수 범위 혼재 |
+
+FastAPI를 Vercel에 배포하는 선택 자체가 이미 하나의 트레이드오프다. Vercel은 Python 서버리스 함수를 지원하지만, 장기 실행 연결(WebSocket, 장시간 스트리밍)이나 대용량 파일 처리는 제약이 있다. API의 특성이 Vercel 서버리스 모델에 맞는지 먼저 확인해야 한다.
+
+배포 환경이 두 개로 늘어나면 Preview 단계에서 프론트엔드와 백엔드의 버전이 맞지 않는 상황이 생길 수 있다. 예를 들어 API 계약을 변경하는 PR에서 프론트엔드 Preview는 새 스펙으로 빌드됐지만 백엔드 Preview는 아직 배포되지 않은 경우다. 이를 막으려면 같은 PR에서 두 변경을 함께 배포하거나, 하위 호환 API 변경을 원칙으로 삼아야 한다.
+
+## 배운 것
+
+저장소 경계와 배포 경계는 다른 개념이다. 저장소를 하나로 유지하면서 배포만 분리하는 방법이 있고, 그 방법은 Vercel의 루트 디렉터리 설정으로 구현할 수 있다. 저장소를 분리해야만 배포를 독립시킬 수 있다는 가정은 틀렸다.
+
+환경 변수는 배포 경계를 잇는 계약이다. `NEXT_PUBLIC_API_BASE_URL`과 `WEB_ORIGIN`이 환경마다 올바르게 지정되어 있지 않으면, 빌드가 성공하더라도 프론트엔드와 백엔드가 서로 다른 환경을 바라보거나 CORS 오류로 연결이 차단된다. 배포 후 검증의 첫 번째 질문은 "두 서비스가 같은 환경의 서로를 바라보는가"다.
+
+업스트림 중복 작업은 로컬 구현을 고집하지 않는 편이 낫다. 이미 병합된 업스트림 버전이 있다면, 로컬 버전을 제거하고 업스트림을 신뢰하는 쪽이 기술 부채와 merge 비용 모두를 줄인다.
