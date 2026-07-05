@@ -1,0 +1,116 @@
+---
+title: "MVP에서 BaaS를 쓰되 인증 경계를 지키는 법"
+date: "2026-06-29"
+summary: "관리형 DB/BaaS로 빠르게 MVP를 검증하면서도 내부 인증 체계로 포팅할 여지를 남기는 경계 설계 원칙을 정리한다."
+tags:
+  - backend
+  - auth
+  - architecture
+  - mvp
+---
+
+## 문제 정의
+
+AI 채팅 같은 기능을 빠르게 검증할 때 관리형 Postgres, 벡터 DB, LLM API를 조합하면 속도는 나온다. 그런데 BaaS 스택을 선택할 때 인증까지 BaaS에 넘기면 나중에 내부 인증 서비스로 포팅할 때 비용이 커진다. 사용자 식별 방식, 토큰 형식, 세션 저장 위치가 모두 외부 제공자에 묶이기 때문이다.
+
+반대로 처음부터 내부 인증 서비스를 통합하면 MVP 속도를 잃는다.
+
+이 둘 사이의 균형을 잡는 것이 문제다.
+
+## 경계 설계
+
+### 인증 책임은 내부 인증 서비스에 둔다
+
+MVP 단계에서도 인증 판단(토큰 발급, 검증, 세션 관리)은 내부 인증 서비스가 담당한다. BaaS Auth 기능은 쓰지 않는다. 이유는 하나다. BaaS Auth를 쓰면 사용자 식별자와 토큰 형식이 BaaS 제공자에 종속되고, 포팅 시 모든 인증 흐름을 다시 짜야 한다.
+
+```
+[클라이언트]
+    ↓  (access token)
+[내부 API 게이트웨이]  ← 토큰 검증
+    ↓  (검증된 user_id만 전달)
+[BaaS / 관리형 Postgres / LLM API]
+```
+
+클라이언트가 BaaS나 LLM API와 직접 통신하는 구조는 피한다. 요청은 반드시 내부 API를 통해 라우팅한다.
+
+### 토큰은 외부로 나가지 않는다
+
+access token, refresh token은 BaaS나 LLM API에 저장하거나 전달하지 않는다. 내부 API가 토큰을 검증한 뒤 `user_id` 같은 식별자만 하위 서비스로 전달한다. 외부 제공자가 토큰 값을 알게 되는 경로가 없어야 한다.
+
+```
+# 잘못된 방향 (토큰이 외부로 나감)
+llm_api.call(prompt=..., auth_token=user_token)
+
+# 올바른 방향 (식별자만 전달)
+verified_user_id = internal_auth.verify(user_token)
+llm_api.call(prompt=..., user_id=verified_user_id)
+```
+
+### Repository 계층으로 DB 교체 가능성을 확보한다
+
+MVP에서는 관리형 Postgres를 쓰더라도 데이터 접근을 Repository 인터페이스 뒤에 둔다. 구현체는 외부 DB를 가리키지만, 인터페이스는 내부 DB나 내부 API 구현으로 바꿀 수 있는 형태여야 한다.
+
+```python
+# 인터페이스 (변하지 않는 계약)
+class ConversationRepository(Protocol):
+    def save(self, user_id: str, message: Message) -> None: ...
+    def list(self, user_id: str) -> list[Message]: ...
+
+# MVP 구현체 (관리형 Postgres)
+class PostgresConversationRepository:
+    def save(self, user_id, message): ...
+    def list(self, user_id): ...
+
+# 포팅 후 구현체 (내부 API)
+class InternalApiConversationRepository:
+    def save(self, user_id, message): ...
+    def list(self, user_id): ...
+```
+
+비즈니스 로직은 인터페이스에만 의존한다. 구현체 교체는 DI 설정 한 곳에서 끝난다.
+
+## 트레이드오프
+
+| 선택                 | 얻는 것                        | 잃는 것                                    |
+| -------------------- | ------------------------------ | ------------------------------------------ |
+| BaaS Auth 배제       | 포팅 비용 최소, 토큰 통제 유지 | BaaS의 소셜 로그인·MFA 기능 미사용         |
+| Repository 계층 추가 | DB 교체 가능성                 | MVP 초기 코드량 소폭 증가                  |
+| 토큰 외부 전송 금지  | 인증정보 유출 경로 차단        | 외부 제공자의 사용자별 맥락 기능 사용 불가 |
+
+BaaS가 제공하는 편의 기능(소셜 로그인, 실시간 구독 등)이 비즈니스에 필요하다면 이 경계 설계는 비용이 된다. 하지만 내부 인증 체계가 이미 있고 포팅 가능성이 중요한 상황이라면 이 제약이 나중의 재작성을 막는다.
+
+## 검증 방법
+
+### 로컬 실행 가능 상태부터 확인한다
+
+로컬에서 API, Web, 인프라(DB, 벡터 DB 등)를 모두 띄운 뒤 health와 smoke test를 통과시키는 것을 시작 조건으로 삼는다. 이 단계에서 흔히 막히는 지점은 포트 충돌이다.
+
+```bash
+# 포트 충돌 확인 예시
+lsof -i :5432   # 로컬에 이미 Postgres가 떠 있으면 Docker Postgres와 충돌
+```
+
+로컬 환경에 이미 사용 중인 서비스가 있으면 Docker 컨테이너를 다른 포트로 매핑해야 한다. 포트 설정을 묵시적으로 두면 "왜 연결이 안 되지"를 디버깅하다 시간을 쓴다. `.env` 또는 `docker-compose.yml`에서 포트를 명시하고, health check 스크립트에서 각 서비스의 실제 응답을 확인한다.
+
+체크리스트:
+
+- [ ] API health endpoint 응답 확인
+- [ ] Web 빌드·타입체크 통과
+- [ ] DB 연결 및 마이그레이션 상태 확인
+- [ ] 인증 흐름 smoke test (토큰 발급 → 검증 → 보호된 엔드포인트 접근)
+
+### 벡터 컬렉션 생성은 미룬다
+
+임베딩 모델이 확정되지 않았다면 벡터 DB의 컬렉션(인덱스)을 미리 만들지 않는다. 벡터 컬렉션은 차원 수를 고정해 생성하며, 모델이 바뀌면 재생성해야 한다. 이런 외부 리소스는 입력 계약(임베딩 모델, 차원 수)이 확정된 뒤에 만드는 것이 원칙이다.
+
+같은 맥락에서, 스키마가 한번 만들어지면 재생성 비용이 있는 외부 리소스(벡터 인덱스, 검색 인덱스, BigQuery 파티션 테이블 등)는 모두 입력 계약 확정 전 생성을 미룬다.
+
+## 배운 것
+
+MVP에서 BaaS를 쓸 때 포팅 가능성을 망치는 결정은 대부분 초반에 조용히 이루어진다. BaaS Auth를 "일단 연결"하거나, 토큰을 그냥 외부로 넘기거나, DB 접근을 인터페이스 없이 직접 작성하는 것들이다.
+
+이 세 가지만 지키면 MVP 속도와 포팅 가능성을 동시에 잡을 수 있다.
+
+1. **인증 판단은 내부에서**: BaaS Auth 배제, 토큰 외부 전송 금지
+2. **데이터 접근은 인터페이스 뒤로**: Repository/Port 계층 추가
+3. **외부 리소스 생성은 계약 확정 후**: 입력 스키마가 바뀔 수 있는 리소스는 미룬다
