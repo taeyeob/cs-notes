@@ -1,0 +1,209 @@
+---
+title: "환경별 데이터 불일치를 전제한 안전한 Backfill 마이그레이션 설계"
+date: "2026-07-07"
+summary: "dev/stage와 prod의 데이터 상태가 다를 때, 존재하지 않는 참조값 때문에 마이그레이션이 멈추지 않도록 설계하는 방법을 정리한다."
+tags:
+  - backend
+  - django
+  - migration
+  - data-engineering
+---
+
+## 문제 정의
+
+신규 모델을 도입하고 기존 데이터를 새 구조로 옮기는 backfill 마이그레이션은 prod 기준으로 설계하기 쉽다. 그러나 같은 마이그레이션을 dev와 stage에도 실행해야 한다. 여기서 문제가 생긴다.
+
+팀의 개발 서버와 스테이징 서버에는 보통 실 서버와 다른 상태의 데이터가 있다.
+
+- prod에는 수백 건의 이벤트가 있고 각각 지역 정보가 연결되어 있다.
+- dev에는 테스트용 이벤트 10개가 있고, 일부는 실 서버 데이터와 구조가 다르다.
+- stage에는 prod를 복사한 스냅샷이 있지만 최신이 아닐 수 있다.
+
+이 상황에서 "prod 기준 명시 매핑"으로 작성된 마이그레이션을 그대로 실행하면 dev에서 `DoesNotExist` 예외가 발생하고 마이그레이션이 중단된다. 마이그레이션이 중단되면 이어지는 다른 마이그레이션도 실행되지 않는다.
+
+## 왜 마이그레이션이 환경마다 달라지는가
+
+데이터 backfill 마이그레이션은 세 가지 방식으로 실패한다.
+
+**1. 참조 레코드 없음**: 매핑 테이블에 `"도쿄" → "JP-TOKYO"`를 정의했는데 dev DB에 `JP-TOKYO` Location 레코드가 없다.
+
+**2. 원본 레코드 없음**: prod 이벤트 ID 1234를 특정해서 처리하는 코드를 작성했는데 dev에는 그 ID의 이벤트가 없다.
+
+**3. 연결 상태 불일치**: prod에서는 이벤트에 지역 태그가 연결되어 있어 "마이그레이션의 입력"이 될 수 있지만, dev에는 태그 자체가 없다.
+
+## 안전하지 않은 마이그레이션의 예
+
+```python
+def migrate_event_locations(apps, schema_editor):
+    Event = apps.get_model("commerce", "Event")
+    Location = apps.get_model("commerce", "Location")
+
+    TAG_TO_LOCATION_CODE = {
+        "도쿄": "JP-TOKYO",
+        "오사카": "JP-OSAKA",
+        "서울": "KR-SEOUL",
+    }
+
+    for event in Event.objects.prefetch_related("tags").all():
+        for tag in event.tags.all():
+            code = TAG_TO_LOCATION_CODE.get(tag.name.strip())
+            if code:
+                location = Location.objects.get(code=code)  # 💥 dev에 없으면 DoesNotExist
+                EventLocation.objects.create(event=event, location=location)
+```
+
+`Location.objects.get(code=code)` 한 줄이 문제다. prod에서 `JP-TOKYO` 레코드가 항상 존재한다는 전제로 작성했지만, dev에는 없을 수 있다.
+
+## 환경 안전 설계의 원칙
+
+**원칙 1: `get()`을 `filter().first()`로 교체한다**
+
+존재하지 않아도 `None`을 반환하게 하고, `None`이면 조용히 건너뛴다.
+
+```python
+location = Location.objects.filter(code=code).first()
+if location is None:
+    # dev/stage에서는 이 Location이 없을 수 있다 — 건너뜀
+    continue
+```
+
+**원칙 2: `get_or_create`로 idempotent하게 만든다**
+
+연결 관계를 만드는 작업은 `create` 대신 `get_or_create`를 사용해 중복 실행에도 안전하게 한다.
+
+```python
+EventLocation.objects.get_or_create(
+    event=event,
+    location=location,
+    defaults={"source": "MIGRATED"},
+)
+```
+
+**원칙 3: 예외가 발생해도 마이그레이션 전체를 멈추지 않는다**
+
+```python
+try:
+    EventLocation.objects.get_or_create(...)
+except IntegrityError:
+    # 이미 다른 경로로 연결됐다면 건너뜀
+    pass
+```
+
+단, `Exception`을 너무 넓게 잡으면 실제 버그를 숨긴다. 예상 가능한 환경 차이로 인한 예외만 좁게 처리한다.
+
+**원칙 4: 건너뛴 항목을 기록한다**
+
+조용히 건너뜀은 운영 환경에서 데이터가 연결되지 않는다는 뜻이기도 하다. prod에서 어떤 데이터가 누락됐는지 확인할 수 있게 로그를 남긴다.
+
+```python
+import logging
+logger = logging.getLogger(__name__)
+
+location = Location.objects.filter(code=code).first()
+if location is None:
+    logger.warning(
+        "Location not found during migration",
+        extra={"code": code, "event_id": event.id},
+    )
+    continue
+```
+
+## 안전한 backfill 마이그레이션 예
+
+```python
+import logging
+from django.db import migrations
+
+logger = logging.getLogger(__name__)
+
+TAG_TO_LOCATION_CODE = {
+    "도쿄": "JP-TOKYO",
+    "오사카": "JP-OSAKA",
+    "서울": "KR-SEOUL",
+}
+
+
+def backfill_event_locations(apps, schema_editor):
+    Event = apps.get_model("commerce", "Event")
+    Location = apps.get_model("commerce", "Location")
+    EventLocation = apps.get_model("commerce", "EventLocation")
+
+    skipped_codes = set()
+    created_count = 0
+
+    for event in Event.objects.prefetch_related("tags").iterator():
+        for tag in event.tags.all():
+            code = TAG_TO_LOCATION_CODE.get(tag.name.strip().lower())
+            if not code:
+                continue
+
+            location = Location.objects.filter(code=code).first()
+            if location is None:
+                skipped_codes.add(code)
+                continue
+
+            _, created = EventLocation.objects.get_or_create(
+                event=event,
+                location=location,
+                defaults={"source": "MIGRATED"},
+            )
+            if created:
+                created_count += 1
+
+    if skipped_codes:
+        logger.warning(
+            "Some location codes were not found during migration. "
+            "This is expected in dev/stage. In prod, verify these codes exist: %s",
+            sorted(skipped_codes),
+        )
+
+    logger.info("EventLocation backfill complete. Created: %d", created_count)
+
+
+def reverse_backfill(apps, schema_editor):
+    EventLocation = apps.get_model("commerce", "EventLocation")
+    EventLocation.objects.filter(source="MIGRATED").delete()
+
+
+class Migration(migrations.Migration):
+    dependencies = [
+        ("commerce", "0135_add_event_location"),
+    ]
+
+    operations = [
+        migrations.RunPython(backfill_event_locations, reverse_backfill),
+    ]
+```
+
+## 설계 포인트 정리
+
+### iterator() 사용
+
+대량 데이터를 순회할 때 `all()`은 전체를 메모리에 올린다. `iterator()`는 청크 단위로 읽어 메모리 사용을 줄인다. 단, `prefetch_related`는 `iterator()`와 함께 쓰면 prefetch가 동작하지 않으므로 `prefetch_related`를 제거하거나 배치 전략을 별도로 구성해야 한다.
+
+### source 필드의 역할
+
+`source="MIGRATED"` 필드를 두면:
+- 마이그레이션으로 만들어진 연결과 이후 수동으로 추가된 연결을 구분할 수 있다.
+- `reverse_backfill`에서 `MIGRATED`인 것만 선택적으로 삭제할 수 있어 롤백이 안전하다.
+- 나중에 "마이그레이션 결과를 감사"하거나 재실행 전에 기존 결과를 정리할 때 유용하다.
+
+### 역마이그레이션 (`reverse_backfill`)
+
+`RunPython`에 역함수를 제공하지 않으면 `--backwards` 옵션으로 롤백할 수 없다. `source="MIGRATED"`를 기준으로 안전하게 되돌릴 수 있게 작성해 두면 개발 중 실험과 롤백이 편해진다.
+
+## 트레이드오프
+
+| 방식 | 장점 | 단점 |
+|---|---|---|
+| 건너뜀 + 경고 로그 | 환경 어디서든 실행 가능, 에러 없음 | prod에서도 데이터 누락 시 조용히 넘어갈 수 있음 |
+| 하드 실패 | 누락 즉시 발견 | dev/stage 마이그레이션 막힘 |
+| 환경 분기 | prod에서만 엄격하게 실행 가능 | 코드가 복잡해지고 환경 분기 자체가 실수 유발 |
+
+prod에서의 데이터 완전성이 중요하다면, 마이그레이션 후 별도의 `management command`나 데이터 검증 스크립트를 실행해 누락을 확인하는 방법이 마이그레이션 코드를 단순하게 유지하면서 prod 정확성도 확보하는 절충안이다.
+
+## 배운 것
+
+backfill 마이그레이션을 "prod 데이터 기준으로 딱 맞게" 작성하면 prod에서는 완벽히 동작하지만 팀의 다른 환경에서 실행할 때마다 수동 수정이 필요해진다. 처음부터 "이 환경에 이 레코드가 없을 수도 있다"는 전제로 `filter().first()`와 `get_or_create` 조합으로 작성하면 코드 줄 수는 비슷하면서 어느 환경에서도 실행 가능한 마이그레이션이 된다.
+
+prod 데이터 완전성은 마이그레이션 코드가 아니라 배포 후 검증 단계에서 담당하는 것이 역할 분리 측면에서도 더 명확하다.
