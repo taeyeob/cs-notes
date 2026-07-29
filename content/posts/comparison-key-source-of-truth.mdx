@@ -1,0 +1,203 @@
+---
+title: "비교 키와 표시값 분리하기: 정규화는 비교할 때만"
+date: "2026-07-28"
+summary: "중복 집계에서 이름 동등성을 판별할 때 비교용 키는 공백 제거와 casefold로 파생하되 저장값과 표시값은 원본 그대로 유지하는 설계와, 별도 필드가 있을 때 fullname을 추론하지 않아야 하는 이유를 정리한다."
+tags:
+  - backend
+  - data-consistency
+  - normalization
+  - source-of-truth
+---
+
+## 문제 정의
+
+주문이나 응모 데이터를 집계할 때 같은 사람이 여러 건을 제출한 경우 중복을 제거해야 한다. 이름은 비교에 자주 쓰이는 필드 중 하나다.
+
+단, 이름 키 하나만으로 동일인을 확정하는 것은 충분하지 않다. 이름이 같아도 다른 사람일 수 있다. 이름 비교 키는 이미 범위가 좁혀진 후보 집합 안에서 활용하거나, 제품이 정의한 복합 식별 조건의 한 축으로 사용해야 한다. 이 글은 그 비교를 정확하게 수행하기 위한 정규화 키 설계에 집중한다.
+
+그런데 이름 비교 자체도 생각보다 까다롭다. 합성 예시를 보면:
+
+- `"Blex Grondo"` 과 `"blex grondo"` — 같은 값이지만 단순 문자열 비교는 실패한다
+- `"Blex  Grondo"` (중간 공백 2개) — 마찬가지로 다른 값으로 취급된다
+- `"Blex Grondo "` (뒤에 공백) — 역시 다르다
+- `"Blex\tGrondo"` (탭) — 탭도 공백이지만 스페이스와 다른 코드포인트다
+
+이 네 개를 단순 `==` 비교로 판별하면 모두 다른 항목으로 취급된다. 그렇다고 DB에 저장할 때부터 이름을 정규화해버리면 원본 표시값이 사라진다.
+
+## 실패하기 쉬운 접근
+
+### 저장 시점에 정규화하기
+
+가장 흔한 실수는 입력받은 이름을 정규화한 뒤 그 값을 DB에 저장하는 것이다.
+
+```python
+# 위험한 패턴 — 원본이 사라진다
+record["name"] = "".join(raw_name.split()).casefold()
+save(record)
+```
+
+`"Blex Grondo"` → `"blexgrondo"`로 저장하면 엑셀 내보내기나 API 응답에서 원본 표기가 복원 불가능하다. 운영자가 입력 원본을 나중에 확인하려 해도 이미 덮어 써진 상태다.
+
+### fullname에서 성/이름을 추론하기
+
+다른 유혹은 fullname에서 성(last name)과 이름(first name)을 코드로 파싱하는 것이다.
+
+```python
+# 위험한 패턴 — 언어와 이름 관례에 따라 틀린다
+parts = fullname.split()
+first_name = parts[0]
+last_name = parts[-1]
+```
+
+이름의 앞뒤 순서는 언어마다, 문화마다 다르다. 동아시아 이름은 성이 앞에 오고, 서양식 이름은 성이 뒤에 온다. 미들네임이 있는 경우도 있다. 공백의 위치나 개수만으로 성/이름을 안전하게 구분하는 단일 규칙은 없다.
+
+## 비교 키와 표시값을 분리한다
+
+핵심 원칙은 하나다: **정규화는 비교하는 시점에만 적용한다. 저장값과 표시값은 원본 그대로 유지한다.**
+
+```python
+def make_comparison_key(value: str) -> str:
+    """비교 전용 키. 저장이나 응답에 사용하지 않는다."""
+    return "".join(str(value).split()).casefold()
+```
+
+`str.split()`은 인수 없이 호출하면 Python이 Unicode 공백 문자(스페이스, 탭, 개행, 기타 유니코드 공백 코드포인트 등) 전체를 기준으로 분리하고 앞뒤 공백도 함께 제거한다. `casefold()`는 대소문자 구분 없이 비교할 수 있도록 처리한다. 두 연산을 합치면 표기 형태 차이를 무시하고 동일성을 판별할 수 있는 키가 만들어진다.
+
+이름 키는 이미 범위가 좁혀진 후보 집합 안에서, 또는 제품이 정의한 복합 식별 조건의 한 축으로 사용한다. 이름 키 단독으로 동일인을 확정하지 않는다.
+
+```python
+# 아래는 특정 이벤트·기간 범위로 이미 좁혀진 후보 집합에서
+# 이름 표기 차이를 무시하고 그룹화하는 예시다.
+seen = {}
+
+for record in candidate_records:
+    key = make_comparison_key(record["name"])
+    if key in seen:
+        # 같은 이름 키 — 정책에 따라 중복 처리
+        continue
+    seen[key] = record
+    # record["name"]은 건드리지 않는다
+
+# 응답이나 엑셀 출력에는 record["name"]의 원본 값을 그대로 사용한다
+```
+
+키는 그룹화 연산이 끝나면 버린다. 응답을 내려보낼 때는 원본 `record["name"]`을 그대로 사용한다.
+
+## source of truth는 별도 저장 필드다
+
+성(surname)과 이름(given_name)이 이미 별도 컬럼으로 저장되어 있다면, 그 필드가 source of truth다. fullname을 파싱해서 추론하지 않는다.
+
+```python
+# 올바른 접근 — 이미 저장된 별도 필드를 직접 사용한다
+surname = record["surname"]          # 성 원천 필드
+given_name = record["given_name"]    # 이름 원천 필드
+# 표시 순서나 구분자는 UI 계약이 별도로 결정한다; 여기서 재조합하지 않는다
+
+# 잘못된 접근 — fullname에서 파싱을 시도한다
+# parts = record["fullname"].split()
+# surname = parts[-1]   # 언어 관례에 종속된 추론 — 언어마다 성의 위치가 다르다
+```
+
+별도 필드가 없고 fullname만 있을 때의 fallback은 제품 계약으로 명시해야 한다. "fullname 전체를 표시 이름으로 쓴다"처럼 정책을 명시적으로 적어둔다. 조용히 추론하는 코드를 기본값으로 삼으면 예외 케이스가 운영 중에 발견된다.
+
+별도 필드 중 하나가 빈 값인 경우에도 마찬가지다. fallback 정책이 없으면 "성 원천이 빈 문자열일 때 어떻게 처리하는가"를 각자 다르게 구현하게 된다.
+
+## 트레이드오프
+
+### 공백 제거와 casefold의 한계
+
+"모든 공백 제거 + casefold"는 표기 차이를 거르는 가장 기본적인 계약이다. 그러나 충분하지 않은 케이스가 있다.
+
+- `é`와 `e` 같은 발음 구별 기호 차이
+- 전각/반각 문자 혼용
+- 구두점(`-`, `.`) 차이 (`O'Brien` vs `OBrien`)
+
+이런 케이스는 Unicode 정규화 형식(NFKC/NFC 등)이나 구두점 제거 같은 추가 정책을 별도로 논의한 뒤 비교 키 생성 함수에 명시적으로 추가해야 한다. 처음부터 모든 가능성을 커버하려 하면 복잡도가 빠르게 높아진다. 공백 제거 + casefold를 기준으로 잡고, 실제로 문제가 드러나는 케이스에 한해 정책을 확장하는 편이 낫다. 확장할 때는 "이 변환을 비교 키에 추가한다"는 결정을 팀 계약으로 명시한다.
+
+### 다른 필드에 같은 규칙을 적용하지 않는다
+
+비교 키 설계가 유용하다고 해서 전화번호, 이메일, 생년월일 등 다른 필드에 같은 방식을 무분별하게 확장하면 안 된다.
+
+필드마다 동일성 계약이 다르다.
+
+- **전화번호**: 국가코드 포함 여부, 하이픈 유무, 앞자리 0 처리 방식이 각각 다른 정책을 요구한다. 공백 제거만으로는 충분하지 않다.
+- **이메일**: RFC 기준으로는 로컬 파트가 대소문자를 구분할 수 있지만 실제 대부분의 서비스는 구분하지 않는다. 도메인 파트와 로컬 파트를 분리해서 다뤄야 할 수 있다.
+- **생년월일**: 포맷 차이(YYYY-MM-DD vs YYYYMMDD)는 파싱 레이어에서 처리하고, 비교 자체는 날짜 타입으로 해야 한다.
+
+이름에서 작동한 규칙이 다른 필드에서도 작동한다는 보장이 없다. 새로운 필드를 비교 대상에 추가할 때마다 해당 필드의 동일성 계약을 별도로 정의한다.
+
+## 검증 방법
+
+다음 테스트 축을 기준으로 비교 키 로직과 표시값 분리를 검증한다.
+
+```python
+def make_comparison_key(value: str) -> str:
+    return "".join(str(value).split()).casefold()
+
+
+# --- 비교 키 정규화 ---
+
+def test_대소문자_차이는_같은_키():
+    assert make_comparison_key("Blex Grondo") == make_comparison_key("blex grondo")
+
+def test_앞뒤_공백은_같은_키():
+    assert make_comparison_key("  Blex Grondo  ") == make_comparison_key("Blex Grondo")
+
+def test_중간_공백_여러_개는_같은_키():
+    assert make_comparison_key("Blex  Grondo") == make_comparison_key("Blex Grondo")
+
+def test_탭과_개행은_같은_키():
+    assert make_comparison_key("Blex\tGrondo") == make_comparison_key("Blex\nGrondo")
+    assert make_comparison_key("Blex\tGrondo") == make_comparison_key("Blex Grondo")
+
+def test_서로_다른_이름은_다른_키():
+    assert make_comparison_key("Blex Grondo") != make_comparison_key("Zora Qwyn")
+
+
+# --- 원본 데이터 불변성 ---
+
+def test_원본_표시값은_변경되지_않는다():
+    original_name = "Blex  Grondo "
+    record = {"name": original_name}
+    key = make_comparison_key(record["name"])
+    assert key == "blexgrondo"
+    assert record["name"] == original_name  # 원본은 그대로여야 한다
+
+def test_다른_필드는_비교_키_생성_후에도_불변():
+    record = {"name": "Blex Grondo", "email": "blex@fictional.example", "phone": "000-0000-0000"}
+    _ = make_comparison_key(record["name"])
+    assert record["email"] == "blex@fictional.example"
+    assert record["phone"] == "000-0000-0000"
+
+
+# --- source of truth ---
+
+def test_별도_성이름_필드가_있으면_fullname_파싱하지_않는다():
+    record = {"surname": "Grondo", "given_name": "Blex", "fullname": "Grondo Blex"}
+    # 별도 필드를 직접 사용한다; fullname에서 순서를 추론하지 않는다
+    assert record["surname"] == "Grondo"
+    assert record["given_name"] == "Blex"
+    # 아래처럼 fullname을 파싱해서 순서를 추론하지 않는다
+    # parts = record["fullname"].split()  # 언어에 따라 surname 위치가 다르다
+
+def test_원천_필드_누락_시_명시된_정책으로_처리한다():
+    record = {"surname": "Grondo", "given_name": "", "fullname": "Grondo"}
+    # 조용히 추론하지 않는다. 정책을 명시적으로 적용한다
+    surname = record["surname"]
+    given_name = record["given_name"]
+    # 계약: given_name 원천이 없을 때 surname 원천 필드만 사용한다
+    if not given_name:
+        display = surname  # 명시된 fallback 정책
+    else:
+        display = given_name  # 정상 경로 — 표시 방식은 UI 계약이 별도로 정한다
+    assert display == "Grondo"
+```
+
+"키가 같다"는 테스트와 "원본이 변하지 않는다"는 테스트는 분리해야 한다. 두 성질은 독립적이고, 하나만 확인하면 나머지가 깨진 채로 통과될 수 있다.
+
+## 배운 점
+
+- **정규화 지점을 한 곳으로 모은다.** 비교 키 생성 함수를 순수 함수로 만들어 두면 어디서 호출하든 결과가 예측 가능하다. 저장, 응답, 비교 세 경로에 각기 다른 정규화 코드가 흩어지면 불일치가 발생한다.
+- **원본은 원본대로 산다.** 표시값과 비교 키를 분리하는 이유는 두 가지 목적이 서로 다른 불변식을 요구하기 때문이다. 표시값은 "사용자가 입력한 그대로", 비교 키는 "동등성 판별에 충분한 형태"다.
+- **별도 필드가 있으면 파싱하지 않는다.** source of truth가 이미 구조화된 형태로 저장되어 있다면 그것을 신뢰한다. fullname에서 성/이름을 다시 파싱하는 코드는 언어 관례에 종속된 취약한 추론이다.
+- **계약이 없는 fallback은 나중에 버그가 된다.** 원천 필드가 없을 때 "그냥 추론해서 채운다"는 접근은 운영 중에 예외 케이스가 발견될 때 처리 방법이 코드마다 달라지는 원인이 된다.
