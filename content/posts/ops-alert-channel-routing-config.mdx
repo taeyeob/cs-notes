@@ -1,0 +1,242 @@
+---
+title: "환경별 운영 알림 채널 라우팅을 하드코딩 없이 설정 외부주입과 기본값 fallback으로 설계하는 법"
+date: "2026-07-21"
+summary: "운영 알림 채널을 prod/non-prod별로 분리하고, 전송 로직의 채널 하드코딩을 제거해 설정 외부주입과 기본값 fallback으로 라우팅 계약을 명시하고 테스트로 고정하는 방법을 정리한다."
+tags:
+  - backend
+  - python
+  - operations
+  - configuration
+---
+
+## 문제 정의
+
+운영 알림 전송 코드를 열어보면 이런 패턴이 종종 있다.
+
+```python
+def notify_ops(message, context=None):
+    slack_client.post(channel="#payments-prod", text=message)
+```
+
+로컬에서는 잘 동작한다. 그런데 이 코드는 두 가지 문제를 내포한다.
+
+첫째, **환경 구분이 없다.** 개발·스테이징 환경에서 실행된 테스트나 배치가 프로덕션 채널로 알림을 보낸다. 운영팀은 실제 장애와 테스트 노이즈를 구분해야 하는 부담이 생긴다.
+
+둘째, **채널이 코드에 박혀 있다.** 채널명을 바꾸거나 환경을 추가하려면 코드를 직접 고쳐야 하고, 그 변경이 다른 환경에 의도치 않게 영향을 줄 수 있다. 알림 목적지는 배포 단위가 아닌 환경 설정 단위로 관리되어야 한다.
+
+핵심 문제는 **전송 로직이 알림 목적지를 결정하는 두 가지 역할을 동시에 맡고 있다는 것**이다. 이 두 역할을 분리하는 것이 이 글의 주제다.
+
+## 호출부는 채널을 몰라야 한다
+
+알림을 보내는 코드가 채널명을 직접 알아야 할 이유는 없다. 호출부의 역할은 "이런 이벤트가 발생했다"를 알리는 것이고, 어느 채널로 보낼지는 설정이 결정해야 한다.
+
+```python
+# 나쁜 예: 호출부가 채널을 안다
+def process_order_failure(order_id, error):
+    slack_client.post(channel="#payments-prod", text=f"주문 처리 실패: {order_id}")
+
+# 좋은 예: 호출부는 이벤트 의미만 전달한다
+def process_order_failure(order_id, error):
+    alert_router.send("order_failure", {"order_id": order_id, "error": str(error)})
+```
+
+`alert_router`는 이벤트 종류와 현재 실행 환경을 받아 적절한 채널로 라우팅한다. 호출부는 채널명·환경 분기를 알지 못하고, 채널 변경도 호출부 코드를 건드리지 않고 설정만 수정하면 된다.
+
+이 원칙을 지키면 환경별 분기가 설정에 집중되고, 코드 변경 없이 채널 구성을 교체할 수 있다.
+
+## prod/non-prod 기본값과 env override
+
+라우팅 설정은 두 계층으로 구성한다.
+
+1. **기본값(default)**: 환경 구분에 따른 채널 기본 매핑. 코드에 상수로 정의한다.
+2. **환경 변수 override**: 배포 환경에서 기본값을 덮어쓸 수 있는 외부주입 경로.
+
+```python
+# 기본값 상수 — 코드에 명시적으로 선언한다
+DEFAULT_CHANNELS = {
+    "production": {
+        "order_failure": "#payments-prod",
+        "batch_failure": "#ops-alerts-prod",
+    },
+    "non-production": {
+        "order_failure": "#payments-non-prod",
+        "batch_failure": "#ops-alerts-non-prod",
+    },
+}
+
+def resolve_channel(event_type: str, env: str) -> str:
+    # 1. env override: 환경 변수로 특정 이벤트의 채널을 덮어쓸 수 있다
+    env_key = f"ALERT_CHANNEL_{event_type.upper()}"
+    override = os.environ.get(env_key)
+    if override:
+        return override
+
+    # 2. 환경별 기본값 조회
+    env_group = "production" if env == "production" else "non-production"
+    channels = DEFAULT_CHANNELS.get(env_group, {})
+    channel = channels.get(event_type)
+    if channel:
+        return channel
+
+    # 3. 최종 fallback: 이벤트 타입이 기본값에 없을 때
+    return DEFAULT_CHANNELS["non-production"].get(event_type, "#ops-fallback")
+```
+
+`env`는 실행 환경 식별자(예: `settings.ENVIRONMENT`, `os.environ["ENV"]`)에서 주입받는다. 채널 결정 로직이 한 함수에 모이기 때문에, 라우팅 규칙을 바꾸거나 추가할 때 수정 지점이 명확하다.
+
+환경 변수 override는 다음 두 상황에 유용하다.
+
+- **긴급 우회**: 장애 대응 중 특정 채널을 임시로 변경해야 할 때 재배포 없이 가능하다.
+- **로컬 개발**: 개발자가 자신의 테스트 채널로 보내 prod 채널 노이즈를 줄인다.
+
+## fallback의 장점과 위험
+
+기본값 fallback은 "설정이 누락된 상황에서도 알림이 완전히 소실되지 않는다"는 안전망이다.
+
+**장점**
+
+- 새 이벤트 타입을 추가할 때 채널 설정이 없어도 알림이 일단 전달된다.
+- 설정 오타나 누락이 있어도 운영팀이 fallback 채널에서 신호를 잡을 수 있다.
+
+**위험**
+
+- fallback 채널로 간 알림은 이벤트 유형 맥락이 희석된다. 여러 이벤트가 한 채널로 몰리면 구분이 어렵고 알림 피로도가 높아진다.
+- fallback 채널이 "설정 누락을 숨기는" 역할을 하면 설정 오류가 오래 방치될 수 있다.
+
+이 위험을 완화하는 방법은 **fallback 발생 시 별도로 경고를 남기는 것**이다.
+
+```python
+def resolve_channel(event_type: str, env: str) -> str:
+    env_key = f"ALERT_CHANNEL_{event_type.upper()}"
+    override = os.environ.get(env_key)
+    if override:
+        return override
+
+    env_group = "production" if env == "production" else "non-production"
+    channel = DEFAULT_CHANNELS.get(env_group, {}).get(event_type)
+    if channel:
+        return channel
+
+    # fallback 진입: 설정 누락을 로그로 남긴다
+    logger.warning(
+        "alert_channel_fallback",
+        event_type=event_type,
+        env=env,
+        fallback_channel="#ops-fallback",
+    )
+    return "#ops-fallback"
+```
+
+fallback이 발생하면 로그 또는 별도 메트릭으로 드러나기 때문에, 설정 누락이 조용히 묻히지 않는다.
+
+**fallback을 두지 않는 선택**도 있다. 알림 전송 실패가 치명적이지 않은 부수효과이고, 설정 누락을 조기에 잡는 것이 더 중요한 경우에는 fallback 없이 예외를 발생시켜 CI나 앱 기동 시점에 오류를 잡는 것이 낫다.
+
+```python
+def resolve_channel(event_type: str, env: str) -> str:
+    # fallback 없는 엄격한 버전
+    env_group = "production" if env == "production" else "non-production"
+    channel = DEFAULT_CHANNELS.get(env_group, {}).get(event_type)
+    if channel is None:
+        raise MissingAlertChannelConfig(
+            f"채널 설정 없음: event_type={event_type}, env={env}"
+        )
+    return channel
+```
+
+두 전략의 선택 기준은 "설정 누락을 알림 소실로 허용할 것인가, 아니면 즉시 오류로 드러낼 것인가"다.
+
+## 테스트 전략
+
+채널 라우팅 로직은 환경·override·fallback 각 경로를 독립적으로 검증해야 한다. 실제 Slack 전송을 호출하지 않고, 어느 채널로 전달됐는지를 테스트한다.
+
+**1. prod 기본값 라우팅**
+
+```python
+def test_production_routes_to_prod_channel():
+    channel = resolve_channel("order_failure", env="production")
+    assert channel == "#payments-prod"
+```
+
+**2. non-prod 기본값 라우팅**
+
+```python
+def test_non_production_routes_to_non_prod_channel():
+    channel = resolve_channel("order_failure", env="staging")
+    assert channel == "#payments-non-prod"
+```
+
+**3. 기본값 적용 확인 (override 없음)**
+
+```python
+def test_default_channel_without_override(monkeypatch):
+    monkeypatch.delenv("ALERT_CHANNEL_ORDER_FAILURE", raising=False)
+    channel = resolve_channel("order_failure", env="production")
+    assert channel == "#payments-prod"
+```
+
+**4. env override 우선순위 확인**
+
+```python
+def test_env_override_takes_priority(monkeypatch):
+    monkeypatch.setenv("ALERT_CHANNEL_ORDER_FAILURE", "#payments-hotfix")
+    channel = resolve_channel("order_failure", env="production")
+    assert channel == "#payments-hotfix"
+```
+
+**5. 전송 경로 확인: 실제 채널로 전달됐는지**
+
+채널 결정 함수를 테스트하는 것으로는 "전송 함수가 해당 채널을 사용했는지"를 보장하지 않는다. 전송 경로까지 통합해서 테스트한다.
+
+```python
+def test_alert_is_sent_to_resolved_channel(monkeypatch):
+    sent = {}
+
+    def fake_send(channel, message):
+        sent["channel"] = channel
+        sent["message"] = message
+
+    monkeypatch.setattr("slack_client.post", fake_send)
+
+    alert_router.send("order_failure", {"order_id": "test-001"}, env="production")
+
+    assert sent["channel"] == "#payments-prod"
+    assert "test-001" in sent["message"]
+```
+
+**6. fallback 경로 확인**
+
+```python
+def test_unknown_event_type_uses_fallback_and_logs(caplog):
+    with caplog.at_level("WARNING"):
+        channel = resolve_channel("unknown_event", env="production")
+
+    assert channel == "#ops-fallback"
+    assert "alert_channel_fallback" in caplog.text
+```
+
+테스트에서 `assert_not_called()`와 특정 채널 단언을 함께 쓰면, "잘못된 채널로 전송하지 않는다"는 회귀도 고정할 수 있다.
+
+## 배운 것
+
+운영 알림 채널이 코드에 하드코딩되어 있으면, 환경 추가나 채널 변경 때마다 코드 리뷰와 재배포가 필요하다. 설정 외부주입과 기본값 fallback으로 분리하면 채널 구성 변경이 코드 변경 없이 가능해지고, 테스트로 라우팅 계약을 고정할 수 있다.
+
+핵심 원칙은 세 가지다.
+
+- 호출부는 이벤트 의미만 전달하고 채널을 알지 않는다.
+- 기본값은 prod/non-prod를 명시적으로 구분하고, override는 환경 변수로 제공한다.
+- fallback이 발생하면 조용히 넘어가지 않고 로그나 경고로 드러낸다.
+
+이 구조가 정착되면 새 이벤트 타입을 추가할 때 "기본값 상수에 채널을 추가하고 테스트를 작성"하는 것으로 끝난다. 전송 로직을 건드릴 필요가 없다.
+
+---
+
+## 체크리스트
+
+- [ ] 호출부 코드에 채널명·환경 분기가 없는가?
+- [ ] 채널 기본값이 prod/non-prod 두 그룹으로 명시적으로 선언되어 있는가?
+- [ ] 환경 변수 override 키 네이밍 규칙이 일관적인가? (예: `ALERT_CHANNEL_{EVENT_TYPE}`)
+- [ ] fallback 발생 시 로그 또는 메트릭으로 드러나는가?
+- [ ] fallback을 두지 않는 선택이라면, 설정 누락 시 앱 기동 시점에 오류가 발생하는가?
+- [ ] prod/non-prod/default/override/전송 경로 각각에 테스트가 있는가?
+- [ ] "잘못된 채널로 전송하지 않는다"는 단언이 테스트에 포함되어 있는가?
+- [ ] 알림 페이로드에 채널 라우팅 결과(어느 채널로 갔는지)가 로그에 기록되는가?
