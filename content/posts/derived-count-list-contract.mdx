@@ -1,0 +1,238 @@
+---
+title: "목록 API의 파생 카운트는 목록과 같은 eligibility predicate를 공유해야 한다"
+date: "2026-07-16"
+summary: "그룹 응답에 포함된 count 필드가 상세 목록 API의 실제 항목 수와 어긋나는 버그는 모집단이나 집계 단위가 달라서 생긴다. 두 연산이 동일한 eligibility predicate와 count unit을 공유하도록 설계하는 방법을 정리한다."
+tags:
+  - backend
+  - api
+  - database
+  - testing
+---
+
+## 문제 정의
+
+그룹(또는 카테고리, 세션 등 상위 엔티티)을 목록으로 반환하는 API가 있다고 하자. 각 그룹 응답에는 소속 항목 수를 나타내는 파생 필드(`item_count`, `participant_count` 등)가 포함된다. 클라이언트는 이 숫자를 UI에 표시하거나 페이지네이션 힌트로 활용한다.
+
+이때 "그룹 목록 API의 count"와 "그룹 내 항목 상세 목록 API의 실제 항목 수"가 일치하지 않는 버그가 발생하는 경우가 있다. 상세 목록에는 10개가 보이는데 그룹 count는 15로 표시되거나, 반대로 count는 0인데 상세 목록에는 항목이 있다.
+
+원인은 거의 항상 두 가지 중 하나다.
+
+1. **모집단(population)이 다르다.** count 쿼리가 목록 쿼리와 다른 필터 조건을 적용한다. 목록에서는 제외되는 상태(테스트 데이터, 취소 요청 상태, 소프트 딜리트된 항목 등)를 count는 포함하거나, 반대로 count는 필터를 더 좁게 적용한다.
+2. **집계 단위(count unit)가 다르다.** count 쿼리가 DB row 수나 내부 하위 레코드 수를 세는데, 목록 API는 그것을 재구성하여 더 적은 수의 응답 단위로 반환한다. 예를 들어 DB에는 `(상위 엔티티, 옵션)` 조합으로 여러 행이 존재하지만 목록은 상위 엔티티 단위로 병합해서 반환한다.
+
+두 버그의 공통 원인은 count 연산과 목록 연산이 각자 독립적으로 진화하면서 **동기화를 강제하는 메커니즘 없이** 달라진다는 점이다.
+
+## 위험한 패턴
+
+### 패턴 1 — 제외 상태를 count에만 포함
+
+```sql
+-- 위험: count는 모든 status를 포함
+SELECT group_id, COUNT(*) AS item_count
+FROM items
+WHERE group_id = :group_id
+
+-- 목록 API는 활성 상태만 반환
+SELECT *
+FROM items
+WHERE group_id = :group_id
+  AND status = 'active'
+  AND is_test = false
+```
+
+`status = 'active'`와 `is_test = false` 조건이 count 쿼리에 없다. 테스트용으로 생성된 항목이나 취소 요청 상태(UI에는 노출하지 않는 내부 상태)가 count에 합산된다. 처음에는 그 수가 작아서 눈에 띄지 않지만, 테스트 데이터가 쌓이거나 중간 상태 항목이 늘어나면 숫자 차이가 커진다.
+
+### 패턴 2 — 응답 단위와 다른 DB row를 카운트
+
+```sql
+-- DB 스키마: items 테이블에 (parent_id, option_id) 조합으로 여러 행 존재
+-- 예: parent_id=1, option_id=A → row 1
+--     parent_id=1, option_id=B → row 2
+
+-- 위험: DB row 수를 셈
+SELECT group_id, COUNT(*) AS item_count
+FROM items
+WHERE group_id = :group_id AND status = 'active'
+```
+
+목록 API는 `parent_id` 단위로 항목을 병합해서 반환하므로, 위 count는 목록의 실제 항목 수보다 크다. 같은 상위 엔티티가 옵션별로 여러 행을 갖는 경우 항상 이 오차가 생긴다.
+
+### 패턴 3 — dedup key + 집계 함수를 불변식 없이 사용
+
+```sql
+-- 시도: (parent_id, option_id)로 dedup해서 parent_id별 수를 세려는 의도
+SELECT group_id, COUNT(DISTINCT parent_id) AS item_count
+FROM items
+WHERE group_id = :group_id AND status = 'active'
+```
+
+`COUNT(DISTINCT parent_id)`가 맞으려면 "같은 `parent_id`를 가진 모든 행이 동일한 응답 단위로 병합된다"는 불변식이 성립해야 한다. 하지만 아래 상황에서 이 불변식이 깨진다.
+
+- 특정 `parent_id`는 옵션이 달라도 각각 별도 항목으로 노출될 수 있다.
+- 집계 함수(`MAX(quantity)`, `SUM(amount)`)를 함께 쓸 때, "같은 dedup key 안의 하위 행들이 동일한 의미를 갖는다"는 보장이 없다.
+
+불변식이 코드에 명시되거나 테스트로 검증되지 않으면, 이 쿼리는 우연히 맞는 것처럼 보이다가 특정 데이터 조합에서 틀린다.
+
+## 설계 접근
+
+핵심 원칙은 하나다. **count와 목록이 같은 eligibility predicate를 공유한다.**
+
+### 접근 A — shared base query
+
+count와 목록 쿼리가 동일한 CTE 또는 서브쿼리를 기반으로 작동하게 만든다.
+
+두 쿼리는 별도로 실행되지만, 동일한 `eligible_items` CTE 정의를 각자 포함해 eligibility predicate를 공유한다.
+
+```sql
+-- count 쿼리
+WITH eligible_items AS (
+  SELECT *
+  FROM items
+  WHERE status = 'active'
+    AND is_test = false
+    AND deleted_at IS NULL
+)
+SELECT group_id, COUNT(*) AS item_count
+FROM eligible_items
+WHERE group_id = :group_id
+```
+
+```sql
+-- 목록 쿼리 (eligible_items 정의가 count 쿼리와 동일)
+WITH eligible_items AS (
+  SELECT *
+  FROM items
+  WHERE status = 'active'
+    AND is_test = false
+    AND deleted_at IS NULL
+)
+SELECT *
+FROM eligible_items
+WHERE group_id = :group_id
+ORDER BY created_at DESC
+LIMIT :limit OFFSET :offset
+```
+
+CTE 정의가 두 쿼리에 나뉘어 있더라도, 조건을 한 곳에서 관리하고 싶다면 ORM 함수나 뷰로 추출하는 것이 좋다. 조건이 바뀔 때 count와 목록 양쪽에 동시에 반영해야 한다는 점이 핵심이다.
+
+ORM을 쓸 때는 queryset을 반환하는 함수로 추출한다.
+
+```python
+def eligible_items_qs(group_id):
+    return Item.objects.filter(
+        group_id=group_id,
+        status='active',
+        is_test=False,
+        deleted_at__isnull=True,
+    )
+
+# count
+count = eligible_items_qs(group_id).count()
+
+# 목록
+items = eligible_items_qs(group_id).order_by('-created_at')[offset:offset + limit]
+```
+
+`eligible_items_qs`를 수정하면 count와 목록이 동시에 영향을 받는다.
+
+### 접근 B — 목록을 source of truth로 삼아 count를 파생
+
+count가 DB에 미리 저장된 집계 컬럼이 아니라 API 응답 시 계산하는 파생 값이라면, 목록 쿼리 결과에서 count를 도출하는 방식도 유효하다.
+
+```python
+items = eligible_items_qs(group_id).all()
+response = {
+    "items": serialize(items),
+    "count": len(items),  # 목록 자체가 source of truth
+}
+```
+
+이 방식은 목록이 페이지네이션 없이 전체를 반환하는 경우에만 적합하다. 페이지네이션이 있다면 `total_count`를 별도로 구해야 하고, 그 경우 접근 A처럼 동일 predicate를 공유하는 count 쿼리가 필요하다.
+
+### dedup key를 써야 할 때
+
+"응답 단위가 DB row와 다르다"는 상황(패턴 2)에서 `COUNT(DISTINCT parent_id)` 방식을 쓰려면, 다음 조건 중 하나가 충족되어야 한다.
+
+1. **도메인 불변식으로 증명 가능하다.** "같은 `parent_id`를 가진 행들은 항상 하나의 응답 항목으로 병합된다"는 규칙이 비즈니스 로직 레이어에서 강제된다.
+2. **테스트로 검증한다.** 같은 `parent_id` 아래 여러 행이 있는 픽스처를 만들고, count와 목록 길이가 일치하는지 확인하는 테스트가 있다.
+
+이 중 하나도 없으면 dedup key 방식보다 목록 쿼리 자체에서 `DISTINCT parent_id`를 먼저 구한 뒤 그 결과 집합의 길이를 count로 쓰는 게 더 안전하다.
+
+```sql
+-- 응답 단위가 parent_id인 경우
+WITH eligible AS (
+  SELECT DISTINCT ON (parent_id) parent_id, group_id, created_at
+  FROM items
+  WHERE status = 'active' AND is_test = false
+  ORDER BY parent_id, created_at DESC
+)
+SELECT group_id, COUNT(*) AS item_count
+FROM eligible
+WHERE group_id = :group_id
+```
+
+이 방식은 "병합 로직"과 "count 로직"을 동일 쿼리에서 처리하므로 일관성이 보장된다.
+
+## 트레이드오프
+
+| 항목        | count를 독립 쿼리로 관리                             | shared base query / 목록 기반 파생                                    |
+| ----------- | ---------------------------------------------------- | --------------------------------------------------------------------- |
+| 성능        | count만 실행하면 되므로 목록 쿼리보다 가벼울 수 있다 | 목록 쿼리와 count 쿼리를 모두 실행하거나, CTE 오버헤드가 생길 수 있다 |
+| 정합성      | 필터 조건이 두 곳에 분산 → drift 위험                | 필터 조건이 한 곳에 집중 → 동기화 보장                                |
+| 유지보수    | 필터 변경 시 두 쿼리를 모두 수정해야 한다            | 한 곳만 수정하면 된다                                                 |
+| 적합한 상황 | 집계가 별도 배치로 캐싱되는 경우                     | 실시간 집계이거나 count와 목록이 같은 API에서 반환될 때               |
+
+count를 미리 집계해 캐싱하거나 집계 테이블에 따로 저장하는 경우, "캐시 무효화 시점"이 count drift의 또 다른 원인이 된다. 이 경우 캐시를 무효화하는 이벤트 목록이 eligibility predicate 변경 목록과 일치하는지 따로 검토해야 한다.
+
+## 검증 방법
+
+다음 케이스를 통합 테스트로 확보하면 이 유형의 버그를 조기에 잡을 수 있다.
+
+### 체크리스트
+
+- [ ] **목록 길이 == count**: 상세 목록 API의 전체 항목 수와 그룹 응답의 count 필드가 동일한가.
+- [ ] **제외 상태 항목 포함 여부**: 노출에서 제외되는 상태(소프트 딜리트, 테스트 플래그, 내부 전용 상태)의 항목을 포함한 픽스처를 만들었을 때, 해당 항목이 count에도 목록에도 포함되지 않는가.
+- [ ] **같은 상위 엔티티 아래 여러 하위 행 케이스**: `parent_id`가 동일한 행이 여러 개 있을 때, count가 DB row 수가 아닌 응답 단위 수(distinct parent_id 수)를 반영하는가.
+- [ ] **SQL/ORM row 단위 확인**: ORM이 생성한 실제 SQL을 출력해(`queryset.query` 또는 DB 로그) count 쿼리와 목록 쿼리가 동일한 WHERE 조건을 갖는지 확인한다.
+
+```python
+def test_count_matches_list_length(db):
+    group = GroupFactory()
+    # 노출 가능한 항목 3개
+    ItemFactory.create_batch(3, group=group, status='active', is_test=False)
+    # 제외되어야 하는 항목 2개
+    ItemFactory(group=group, status='active', is_test=True)   # 테스트 데이터
+    ItemFactory(group=group, status='requested_cancel')       # 내부 전용 상태
+
+    group_response = api.get_group(group.id)
+    list_response = api.list_items(group_id=group.id)
+
+    assert group_response['item_count'] == 3
+    assert len(list_response['items']) == 3
+    # count와 목록이 동일한 모집단을 참조
+    assert group_response['item_count'] == len(list_response['items'])
+
+
+def test_count_uses_response_unit_not_db_rows(db):
+    group = GroupFactory()
+    parent = ParentItemFactory(group=group, status='active', is_test=False)
+    # 같은 parent_id로 두 개의 하위 행
+    SubItemFactory(parent=parent, option='A')
+    SubItemFactory(parent=parent, option='B')
+
+    group_response = api.get_group(group.id)
+    list_response = api.list_items(group_id=group.id)
+
+    # DB row는 2개지만, 응답 단위는 parent 1개
+    assert group_response['item_count'] == 1
+    assert len(list_response['items']) == 1
+```
+
+픽스처를 코드에 고정해두면, 나중에 count 쿼리나 목록 쿼리 중 하나의 필터 조건이 바뀔 때 이 테스트가 먼저 실패해서 알려준다.
+
+## 배운 점
+
+- **count와 목록이 독립적으로 진화하면 drift가 생긴다.** 두 쿼리를 각자 최적화하다 보면 어느 순간 필터 조건이 어긋난다. eligibility predicate를 한 곳에 두고 재사용하는 구조가 이 drift를 방지하는 유일한 방법이다.
+- **제외 상태는 count 설계 초기에 명시해야 한다.** "어떤 항목이 목록에 보이지 않는가"를 처음부터 문서화하거나 코드에 상수로 표현해두면, 나중에 새 상태가 추가될 때 count와 목록 양쪽에 반영해야 한다는 것을 리뷰 단계에서 잡을 수 있다.
+- **dedup key는 도메인 불변식이 검증된 경우에만 쓴다.** `COUNT(DISTINCT key)` 방식은 "해당 key 아래의 모든 하위 행이 동일한 응답 단위로 귀속된다"는 불변식이 전제다. 이 불변식이 코드 또는 테스트로 증명되지 않으면, 특정 데이터 조합에서 count가 틀린다. 검증이 어렵다면 목록 쿼리 결과를 source of truth로 삼아 count를 파생하는 것이 더 안전하다.
+- **테스트는 "같은 모집단인가"를 직접 단언해야 한다.** count와 목록의 숫자가 우연히 같은 테스트 데이터로는 이 버그를 잡지 못한다. 제외 상태 항목, 중복 DB row, 테스트 플래그 항목을 의도적으로 포함한 픽스처를 만들어야 한다.
