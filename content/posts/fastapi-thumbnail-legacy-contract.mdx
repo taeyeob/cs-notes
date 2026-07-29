@@ -1,0 +1,172 @@
+---
+title: "레거시 썸네일 서비스를 FastAPI로 옮길 때 먼저 고정해야 할 이미지 계약"
+date: "2026-07-09"
+summary: "Django 기반 레거시 썸네일 서비스를 FastAPI로 이전할 때 기존 API와 이미지 출력 계약을 먼저 보존하고, WebP/AVIF 같은 현대 포맷은 호환성 게이트 뒤에서 확장하는 방법을 정리한다."
+tags:
+  - backend
+  - fastapi
+  - image-processing
+  - migration
+---
+
+## 문제 정의
+
+작은 Django 썸네일 서비스가 오래 운영되다 보면 구현은 단순해도 계약은 단순하지 않다. API 경로, 요청 파라미터, 응답 코드, 인증용 헤더, 큐에 넣는 방식, 저장소에 남는 파일명, 이미지 크기와 품질 값까지 이미 여러 소비자가 기대하는 동작이 된다.
+
+이런 서비스를 FastAPI로 옮길 때 "새 서비스니까 WebP로 바꾸자", "품질 값을 다시 튜닝하자"부터 시작하면 위험하다. 마이그레이션의 첫 목표는 더 좋은 이미지를 만드는 것이 아니라 **기존 소비자가 보던 계약을 깨지 않고 새 런타임으로 옮기는 것**이다. 출력 포맷 현대화는 그 다음 단계이며, 소비자 호환성이 확인된 뒤에만 켜야 한다.
+
+이 글은 레거시 Django 썸네일 서비스를 FastAPI로 옮기는 과정에서 확인한 재사용 가능한 기준을 정리한다. 로컬에서는 HTTP API 계약을 stub 모드로 먼저 확인했고, 이미지 처리 함수는 별도 smoke test로 검증했다. DB와 object storage까지 붙인 end-to-end 통합은 별도 게이트로 남겨두는 전제다.
+
+## 기준선: 레거시 계약을 먼저 보존한다
+
+마이그레이션에서 가장 먼저 문서화할 것은 "새 서비스가 무엇을 더 잘할 것인가"가 아니라 "기존 서비스가 실제로 무엇을 하고 있었는가"다.
+
+확인해야 할 기준선은 다음과 같다.
+
+- 기존 endpoint와 method
+- 요청 파라미터 이름과 기본값
+- 인증 또는 내부 호출을 구분하는 secret header
+- 동기 응답인지, Cloud Tasks 같은 큐에 넣고 빠르게 반환하는 fire-and-forget인지
+- 생성되는 썸네일 경로와 파일명 규칙
+- JPEG 저장 품질, resize 크기, crop/fit 규칙
+- EXIF Orientation 보정 여부
+- 실패 시 HTTP status와 응답 body 형태
+
+여기서 중요한 점은 레거시 코드에 박혀 있던 크기와 품질 값을 "새로 최적화한 스펙"처럼 포장하지 않는 것이다. 예를 들어 기존 코드가 `quality=85`, 특정 width/height 조합을 하드코딩하고 있었다면, 첫 단계에서는 그대로 옮긴다. 이 값은 최적값이 아니라 **호환성을 위한 기준선**이다.
+
+```python
+LEGACY_SIZES = {
+    "small": (320, 320),
+    "medium": (640, 640),
+}
+
+LEGACY_JPEG_QUALITY = 85
+```
+
+이렇게 이름에도 `LEGACY`를 남겨두면 리뷰 시 의도가 분명해진다. "우리가 이 값을 새로 설계했다"가 아니라 "기존 출력과 맞추기 위해 보존한다"는 신호가 된다.
+
+## API 계약과 이미지 처리를 분리해서 검증한다
+
+이미지 서비스는 HTTP 계층과 이미지 처리 계층이 동시에 움직이기 때문에 통합 테스트 하나로만 확인하면 실패 원인을 구분하기 어렵다. 특히 마이그레이션 초반에는 외부 DB, object storage, task queue를 모두 붙이기 전에 서비스의 모양을 작게 나누어 확인하는 편이 안전하다.
+
+### 1. Stub 모드로 HTTP 계약 확인
+
+로컬에서는 실제 저장소나 DB를 붙이지 않고 stub 모드로 API 계약을 먼저 확인한다. 목표는 FastAPI 라우터가 레거시 요청을 받아 같은 형태로 응답하는지 보는 것이다.
+
+```python
+@router.post("/internal/thumbnails")
+async def create_thumbnail(
+    payload: ThumbnailRequest,
+    x_secret: str = Header(alias="X-Internal-Secret"),
+):
+    verify_secret(x_secret)
+
+    if settings.STUB_MODE:
+        return {
+            "accepted": True,
+            "mode": "stub",
+            "source_id": payload.source_id,
+        }
+
+    enqueue_thumbnail_job(payload)
+    return {"accepted": True}
+```
+
+이 단계에서 확인할 것은 이미지가 실제로 생성됐는지가 아니다. 기존 클라이언트가 보내던 요청이 새 서비스에서 같은 status와 body shape로 처리되는지, secret header 검증이 유지되는지, 큐잉형 API라면 즉시 반환 계약이 유지되는지를 본다.
+
+### 2. 순수 이미지 처리 smoke test
+
+이미지 처리는 HTTP와 분리된 함수로 두고 별도로 검증한다. 테스트 이미지를 넣어 JPEG가 생성되는지, EXIF Orientation이 보정되는지, 예상 크기 안에 들어오는지를 확인한다.
+
+```python
+def build_legacy_thumbnail(src: Image.Image, size_name: str) -> bytes:
+    target_size = LEGACY_SIZES[size_name]
+    normalized = ImageOps.exif_transpose(src)
+    normalized.thumbnail(target_size)
+
+    out = BytesIO()
+    normalized.convert("RGB").save(
+        out,
+        format="JPEG",
+        quality=LEGACY_JPEG_QUALITY,
+        optimize=True,
+    )
+    return out.getvalue()
+```
+
+이 smoke test는 production storage와 무관하게 실행되어야 한다. 그래야 "라우터가 깨졌는지", "이미지 라이브러리 사용이 깨졌는지", "저장소 연동이 깨졌는지"를 단계별로 분리할 수 있다.
+
+### 3. DB/object-storage end-to-end는 별도 게이트
+
+stub 모드 API 계약과 순수 이미지 처리 검증이 통과해도 마이그레이션이 완료된 것은 아니다. 실제 DB에서 원본 메타데이터를 읽고, object storage에서 원본 이미지를 가져오고, 결과 썸네일을 다시 업로드하고, 레거시 소비자가 그 URL을 읽는 end-to-end 경로는 별도 통합 게이트로 남겨야 한다.
+
+따라서 상태를 이렇게 구분해서 말하는 편이 안전하다.
+
+- 로컬 HTTP API 계약: stub 모드에서 확인됨
+- 이미지 처리 함수: 독립 smoke test로 확인됨
+- DB/object-storage 통합: 별도 환경에서 검증 필요
+
+이 구분이 없으면 로컬에서 `200 OK`를 본 것만으로 실제 마이그레이션이 끝났다고 오해하기 쉽다.
+
+## 현대 포맷은 호환성 게이트 뒤에 둔다
+
+WebP와 AVIF는 JPEG보다 더 작은 파일 크기를 기대할 수 있지만, 썸네일 URL의 확장자와 MIME type을 바꾸는 일은 단순한 성능 개선이 아니다. 기존 소비자가 `.jpg` 확장자를 정규식으로 파싱하거나, 캐시 키에 확장자를 포함하거나, 특정 클라이언트가 AVIF를 지원하지 않을 수 있다.
+
+따라서 첫 배포에서는 JPEG를 기준 출력으로 유지하고, WebP/AVIF는 호환성 게이트 뒤에서 병렬 출력으로 붙이는 것이 안전하다.
+
+```python
+def select_output_formats(consumer: ConsumerProfile) -> list[str]:
+    formats = ["jpeg"]  # baseline
+
+    if consumer.accepts_webp and feature_flags.webp_enabled:
+        formats.append("webp")
+
+    if consumer.accepts_avif and feature_flags.avif_enabled:
+        formats.append("avif")
+
+    return formats
+```
+
+게이트는 `Accept` 헤더, 명시적 consumer 설정, feature flag, 앱 버전 allowlist처럼 관측 가능한 조건을 기반으로 둔다. 핵심은 "새 포맷을 만들 수 있다"와 "기존 소비자가 그 포맷을 받아도 된다"를 분리하는 것이다.
+
+URL 계약도 별도로 다뤄야 한다. 기존 URL이 `/thumbs/{id}.jpg`였다면 이를 곧바로 `/thumbs/{id}.webp`로 바꾸지 않는다. 먼저 JPEG URL을 유지하고, 새 포맷은 별도 URL 또는 content negotiation 경로로 제공한다. 소비자 검증이 끝날 때까지 JPEG는 fallback 또는 parallel output으로 남겨둔다.
+
+## 트레이드오프: Pillow와 pyvips/libvips 선택은 취향 문제가 아니다
+
+Python 이미지 처리에서는 Pillow가 가장 접근하기 쉽고 로컬 검증도 빠르다. 작은 서비스나 낮은 처리량에서는 충분한 선택일 수 있다. 그러나 큰 원본 이미지, 높은 동시성, 많은 썸네일 변형을 다루면 메모리 사용량과 처리 시간이 병목이 된다.
+
+pyvips/libvips는 streaming에 가까운 처리 모델과 낮은 메모리 사용량이 장점이다. 대신 런타임 native dependency, 컨테이너 이미지 구성, 배포 환경의 library 버전 관리가 추가된다.
+
+선택 기준은 "어느 라이브러리가 더 세련됐는가"가 아니라 다음 질문이어야 한다.
+
+- 원본 이미지 크기와 최대 동시 처리량은 어느 정도인가
+- 한 원본에서 몇 개의 파생 썸네일을 만드는가
+- 컨테이너 메모리 제한에서 worst-case 처리가 가능한가
+- native dependency를 운영 환경에서 안정적으로 관리할 수 있는가
+- EXIF, color profile, animated image 같은 입력 변형을 어떻게 다룰 것인가
+
+초기 마이그레이션에서는 Pillow로 레거시 계약을 재현하고, 부하 테스트에서 메모리나 처리 시간이 문제가 될 때 pyvips/libvips 전환을 평가하는 식으로 단계를 나눌 수 있다. 반대로 이미 대용량 이미지와 높은 처리량이 명확하다면 처음부터 libvips 기반으로 검증하는 편이 낫다.
+
+## 검증 체크리스트
+
+레거시 썸네일 서비스를 새 FastAPI 서비스로 옮길 때는 다음 항목을 분리해서 확인한다.
+
+- 레거시 endpoint, method, request/response shape이 문서화되어 있는가
+- secret header나 내부 호출 인증 방식이 유지되는가
+- Cloud Tasks 같은 fire-and-forget API라면 즉시 반환 계약이 깨지지 않는가
+- stub 모드에서 로컬 HTTP 계약 테스트가 통과하는가
+- 순수 이미지 처리 smoke test가 HTTP와 분리되어 있는가
+- JPEG 크기, 품질, EXIF Orientation 처리 기준이 레거시 동작과 맞는가
+- hardcoded size/quality 값을 새 최적화 결과처럼 설명하지 않는가
+- WebP/AVIF 출력이 feature flag나 consumer compatibility gate 뒤에 있는가
+- JPEG fallback 또는 parallel output을 유지하는가
+- DB/object-storage end-to-end 검증을 별도 배포 게이트로 남겨두었는가
+- Pillow와 pyvips/libvips 선택을 처리량, 메모리, 배포 복잡도 기준으로 평가했는가
+
+## 배운 것
+
+마이그레이션의 첫 단계에서 필요한 것은 개선 욕심보다 기준선이다. 레거시 서비스가 오래된 구현을 갖고 있더라도, 그 출력은 이미 소비자와 맺은 계약이다. FastAPI로 옮기는 작업은 이 계약을 먼저 재현한 뒤에야 의미 있는 현대화를 할 수 있다.
+
+API 계약 테스트와 이미지 처리 smoke test를 분리하면 진행 상태를 정확히 말할 수 있다. "stub 모드에서 HTTP 계약은 맞다", "순수 이미지 프로세서는 JPEG를 만든다", "DB와 object storage를 포함한 end-to-end는 아직 남았다"처럼 말할 수 있어야 한다. 이 구분이 있어야 로컬 성공을 production migration 완료로 착각하지 않는다.
+
+WebP/AVIF는 좋은 개선 후보지만, JPEG 계약을 대체하는 순간 호환성 문제가 된다. 새 포맷은 먼저 병렬로 만들고, 소비자별 지원 여부가 확인된 뒤에만 노출한다. 레거시 크기와 품질 값은 새로 최적화한 결과가 아니라 보존해야 할 시작점으로 취급한다. 이 순서를 지키면 마이그레이션과 현대화를 같은 프로젝트 안에서 진행하되, 서로의 위험을 분리할 수 있다.
