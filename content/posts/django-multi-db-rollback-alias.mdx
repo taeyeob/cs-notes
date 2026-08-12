@@ -1,0 +1,363 @@
+---
+title: "Django 다중 DB에서 트랜잭션 상태는 alias 단위로 귀속된다"
+date: "2026-08-12"
+summary: "transaction.atomic()과 set_rollback()의 alias가 다르면 롤백이 의도한 connection에 적용되지 않는다. 다중 DB 환경에서 트랜잭션 상태의 alias 귀속 원칙과 부분 커밋이 발생하는 실패 패턴, 안전한 구현 방법을 정리한다."
+tags:
+  - backend
+  - database
+  - django
+  - consistency
+  - transaction
+---
+
+## 문제 정의
+
+Django는 다중 DB를 connection alias 단위로 관리한다. `transaction.atomic()`, `transaction.set_rollback()`, `transaction.on_commit()` 모두 특정 alias의 connection에 귀속된다. alias를 명시하지 않으면 `DEFAULT_DB_ALIAS`('default')가 적용된다.
+
+문제는 ORM 쓰기가 router에 의해 다른 alias로 라우팅될 때 발생한다.
+
+```python
+# reader/writer router가 읽기와 쓰기 모두 'primary'로 라우팅하는 환경
+class PrimaryWriteRouter:
+    def db_for_read(self, model, **hints):
+        return "primary"  # 이 예시에서는 읽기도 primary로 라우팅
+
+    def db_for_write(self, model, **hints):
+        return "primary"
+
+def process_order(order_id, new_status):
+    with transaction.atomic():  # 'default' connection에 트랜잭션 시작
+        order = Order.objects.get(id=order_id)        # router → 'primary' 조회
+        order.status = new_status
+        order.save()                                   # router → 'primary' 쓰기
+        _run_followup(order)
+```
+
+`transaction.atomic()` 이 `default` connection에 트랜잭션을 열어도, `order.save()`는 router에 의해 `primary` connection으로 간다. `primary` connection은 `default`의 atomic 블록과 무관하게 autocommit 상태로 동작하므로 `save()` 는 즉시 커밋된다. `_run_followup`에서 예외가 발생해 `default` 트랜잭션이 롤백되어도 `primary`에 기록된 상태 변경은 남는다.
+
+`default`와 `primary`가 동일한 물리 DB를 가리키더라도, Django는 alias마다 별도의 connection 객체를 사용한다. 트랜잭션 컨텍스트는 connection 객체 단위로 분리되기 때문에 이 불일치는 물리 DB 구성과 관계없이 발생한다.
+
+## 실패 모드 해부
+
+실패가 발생하는 경로는 두 가지다.
+
+### alias 불일치로 인한 부분 커밋
+
+1. **atomic 진입** — `transaction.atomic()` 이 `default` connection에 트랜잭션 시작
+2. **router 쓰기** — `save()` 가 `primary` connection으로 라우팅, `primary`는 autocommit 상태이므로 즉시 커밋
+3. **예외 발생** — 이후 코드에서 오류
+4. **atomic 롤백** — `default` connection 롤백, 그러나 `primary`에 커밋된 변경은 되돌릴 수 없음
+5. **부분 커밋** — DB에는 상태가 변경됐지만 후속 처리는 완료되지 않은 채로 남음
+
+### 예외 삼키기로 인한 의도치 않은 커밋
+
+alias를 명시해 불일치를 해소했더라도, `except Exception`에서 예외를 삼키고 응답을 반환하면 다른 실패가 생긴다.
+
+```python
+WRITE_DB = "primary"
+
+def update_order(order_id, new_status):
+    with transaction.atomic(using=WRITE_DB):
+        try:
+            order = Order.objects.using(WRITE_DB).get(id=order_id)
+            order.status = new_status
+            order.save(using=WRITE_DB)   # WRITE_DB 트랜잭션 내에 있음
+            _run_followup(order)         # 여기서 예외 발생
+        except Exception:
+            return {"ok": False}         # 예외가 atomic 밖으로 전파되지 않음
+    # atomic.__exit__: 예외 없음, rollback flag 없음 → 커밋
+```
+
+`with transaction.atomic(using=WRITE_DB):` 블록이 예외 없이 정상 종료됐으므로 Django는 커밋을 실행한다. `_run_followup`에서 실패했음에도 불구하고 `save()`로 기록한 상태 변경은 DB에 남는다. 호출자에게는 `{"ok": False}`가 반환되지만 DB 상태는 반영된 채다.
+
+`set_rollback`을 alias 없이 쓰면 두 가지 경로로 문제가 생긴다.
+
+- **경우 1 — 잘못된 alias에 active atomic이 없는 경우**: `set_rollback(True)`는 alias를 지정하지 않으면 `default` connection을 대상으로 한다. `default`에 active atomic block이 없으면 Django는 즉시 `TransactionManagementError`를 발생시킨다. 이 예외는 `except` 핸들러를 빠져나와 writer atomic 밖으로 전파되므로, writer atomic도 예외 종료해 롤백된다. `{"ok": False}` 대신 예상치 못한 예외가 호출자에게 전달되며 의도한 실패 응답 계약이 깨진다.
+- **경우 2 — 잘못된 alias에도 active atomic이 있는 경우**: `default`에 별도의 active atomic이 열려 있다면 `TransactionManagementError`는 발생하지 않는다. rollback flag만 `default` connection에 설정되고, `primary` writer atomic은 예외 없이 종료돼 커밋된다.
+
+아래는 active default atomic이 없는 단순 구조다. 이 경우 경우 1이 적용되어 `TransactionManagementError`가 발생하고 writer도 롤백된다.
+
+```python
+with transaction.atomic(using=WRITE_DB):  # 'primary'
+    try:
+        order.save(using=WRITE_DB)
+        _run_followup(order)
+    except Exception:
+        transaction.set_rollback(True)     # using 없음 → 'default' 대상; 'default'에 active atomic 없으면 즉시 TME
+        return {"ok": False}              # TME 발생 시 이 줄에 도달하지 못함
+```
+
+`transaction.set_rollback(True)` 는 alias를 지정하지 않으면 `default` connection에 flag를 설정한다. `default`에 active atomic이 없으면 즉시 `TransactionManagementError`가 발생하고 writer atomic도 예외 종료돼 롤백된다. `default`에 active atomic이 있더라도(경우 2) `primary` atomic은 이 flag를 인식하지 못하므로 커밋된다.
+
+## 위험 패턴과 안전 패턴
+
+### 위험: router 의존 + alias 없는 atomic
+
+```python
+def create_job(payload):
+    with transaction.atomic():                          # 'default'
+        job = Job.objects.create(**payload)             # router → 'primary', autocommit
+        schedule = Schedule.objects.create(job=job)    # router → 'primary', autocommit
+        _validate_schedule(schedule)                   # 예외 → 'default' 롤백만 됨
+        # 'primary'에 job, schedule은 이미 커밋됨
+```
+
+### 위험: alias 명시했지만 예외 삼키기 + set_rollback alias 오지정
+
+아래 예시는 outer `atomic(using="default")`와 inner `atomic(using=WRITE_DB)`가 동시에 열린 상태에서 inner except가 alias 없는 `set_rollback` 후 `return`하는 경로를 보여 준다. `default`에 active atomic이 있으므로 `TransactionManagementError`는 발생하지 않고, `default` connection에만 rollback flag가 설정된다(경우 2).
+
+```python
+WRITE_DB = "primary"
+
+def create_job(payload):
+    with transaction.atomic(using="default"):            # outer: 'default' active
+        with transaction.atomic(using=WRITE_DB):         # inner: writer atomic
+            try:
+                job = Job.objects.using(WRITE_DB).create(**payload)
+                schedule = Schedule.objects.using(WRITE_DB).create(job=job)
+                _validate_schedule(schedule)             # 예외 발생 가정
+            except Exception:
+                transaction.set_rollback(True)           # using 없음 → 'default'에만 rollback flag
+                return {"ok": False}                     # inner atomic 예외 없이 종료 → WRITE_DB 커밋
+        # inner 정상 종료 → 'primary' writer 커밋
+    # outer 종료 시 'default' rollback flag → default 롤백
+    # 결과: job, schedule은 'primary'에 커밋된 채 실패 응답 반환
+```
+
+### 안전 1: alias 통일 + 예외 전파
+
+```python
+WRITE_DB = "primary"
+
+def create_job(payload):
+    with transaction.atomic(using=WRITE_DB):
+        job = Job.objects.using(WRITE_DB).create(**payload)
+        schedule = Schedule.objects.using(WRITE_DB).create(job=job)
+        _validate_schedule(schedule)
+        # 예외가 전파되면 WRITE_DB 트랜잭션이 롤백됨
+```
+
+`create_job()`이 `transaction.atomic(using=WRITE_DB)`를 직접 열기 때문에 이 함수가 트랜잭션을 소유한다. 예외가 블록 밖으로 전파되면 `atomic.__exit__`이 해당 alias의 트랜잭션을 자동으로 롤백한다. caller는 전파된 예외를 받아 응답으로 변환한다. 이 경우 `set_rollback`은 필요 없다.
+
+### 안전 2: 같은 alias에 rollback flag + 실패 응답 반환
+
+atomic 블록 내부에서 직접 실패 응답을 반환해야 할 때, 같은 alias에 `set_rollback(True, using=WRITE_DB)`를 설정하고 `return`할 수 있다. `atomic.__exit__`은 예외가 없어도 `needs_rollback` flag를 확인해 해당 alias의 트랜잭션(또는 savepoint)을 롤백한다.
+
+```python
+WRITE_DB = "primary"
+
+def create_job(payload):
+    with transaction.atomic(using=WRITE_DB):
+        try:
+            job = Job.objects.using(WRITE_DB).create(**payload)
+            schedule = Schedule.objects.using(WRITE_DB).create(job=job)
+            _validate_schedule(schedule)
+        except Exception:
+            transaction.set_rollback(True, using=WRITE_DB)  # atomic과 같은 alias
+            return {"ok": False}  # WRITE_DB 트랜잭션이 롤백됨
+    return {"ok": True}
+```
+
+이 패턴은 advanced API다. `set_rollback` 설정 이후 같은 alias의 atomic 블록 안에서 쿼리를 계속 실행하면 broken transaction 상태이므로 `TransactionManagementError`가 날 수 있다. 블록 밖 예외 처리(안전 1)로 해결할 수 있다면 그 방식을 우선한다.
+
+## read-modify-write 경로의 alias 일관성
+
+read-modify-write 흐름에서는 모든 연산의 alias를 하나로 통일한다.
+
+```python
+WRITE_DB = "primary"
+
+def process_order(order_id, new_status):
+    with transaction.atomic(using=WRITE_DB):
+        # 읽기: 같은 alias, select_for_update로 동시 수정 방지
+        order = Order.objects.using(WRITE_DB).select_for_update().get(id=order_id)
+
+        order.status = new_status
+
+        # 쓰기: 같은 alias
+        order.save(using=WRITE_DB)
+
+        # 후속 부수효과: 커밋 이후 실행, 같은 alias에 귀속
+        transaction.on_commit(
+            lambda: notify_status_change(order.id, new_status),
+            using=WRITE_DB,
+        )
+```
+
+`.using(WRITE_DB)`, `transaction.atomic(using=WRITE_DB)`, `.save(using=WRITE_DB)`, `transaction.on_commit(..., using=WRITE_DB)` 가 모두 같은 alias를 가리킨다. `on_commit`의 `using`이 다른 alias를 가리키면 두 가지 경우로 나뉜다. 해당 alias가 autocommit 상태(active atomic 없음)이면 callback이 즉시 실행되어 writer 트랜잭션이 롤백되더라도 side effect가 이미 발생한다. 해당 alias에 별도의 active atomic이 열려 있으면 callback은 그 트랜잭션의 커밋 시점에 연동되므로, writer rollback이 발생해도 그 atomic이 커밋되면 callback이 실행될 수 있다. 두 경우 모두 의도한 커밋 이후 실행을 보장하지 못한다.
+
+일관성을 강제하는 방법은 `WRITE_DB` 상수를 파일 또는 모듈 수준에서 선언하고, 읽기 DB는 명시적으로 별도 상수로 관리하는 것이다.
+
+```python
+READ_DB = "replica"
+WRITE_DB = "primary"
+
+def get_order_detail(order_id):
+    return Order.objects.using(READ_DB).get(id=order_id)  # 조회 전용
+
+def update_order_status(order_id, new_status):
+    with transaction.atomic(using=WRITE_DB):
+        order = Order.objects.using(WRITE_DB).select_for_update().get(id=order_id)
+        order.status = new_status
+        order.save(using=WRITE_DB)
+```
+
+## 트레이드오프
+
+### set_rollback(True) vs 예외 재발생
+
+예외를 재발생(`raise`)시키면 `set_rollback`이 필요 없다. `atomic.__exit__`이 예외를 받아 해당 alias의 트랜잭션을 자동으로 롤백한다. 가장 단순하고 권장되는 기본 패턴이다.
+
+`set_rollback(True, using=WRITE_DB)` + `return`은 atomic 블록 내부에서 실패 응답을 직접 반환해야 할 때 사용한다. `atomic.__exit__`은 예외가 없어도 `needs_rollback` flag를 확인해 해당 alias의 트랜잭션을 롤백한다. 주의할 점은 flag 설정 이후 같은 alias의 atomic 블록 안에서 쿼리를 추가 실행하면 broken transaction 상태가 되어 `TransactionManagementError`가 날 수 있다는 것이다.
+
+뷰 레이어에서 HTTP 응답을 직접 구성해야 하는 경우, atomic 블록 밖에서 예외를 잡는 구조로 분리하는 것이 가장 명확하다.
+
+```python
+WRITE_DB = "primary"
+
+def _do_update(order_id, new_status):
+    with transaction.atomic(using=WRITE_DB):
+        order = Order.objects.using(WRITE_DB).select_for_update().get(id=order_id)
+        order.status = new_status
+        order.save(using=WRITE_DB)
+
+def update_order_view(request, order_id):
+    try:
+        _do_update(order_id, request.data["status"])
+    except Order.DoesNotExist:
+        return Response({"error": "not found"}, status=404)
+    except Exception:
+        return Response({"error": "처리 실패"}, status=500)
+    return Response({"ok": True})
+```
+
+### helper의 트랜잭션 소유권
+
+helper 함수가 `transaction.atomic(using=WRITE_DB)`를 직접 열면 트랜잭션 소유권을 갖는다. caller가 이미 열려 있는 트랜잭션에서 helper를 호출하면 savepoint가 생성된다(중첩 atomic). inner atomic에서 발생한 예외가 inner block 밖이지만 outer atomic 안에서 잡혀 처리될 때만 savepoint까지 롤백하고 outer 트랜잭션은 계속된다. 예외가 처리되지 않고 outer atomic 밖까지 전파되면 outer 트랜잭션도 롤백된다. 이 동작이 의도에 맞는지 확인해야 한다.
+
+caller에게 소유권을 넘기려면 helper는 `atomic` 없이 ORM 연산만 수행하고, caller가 `with transaction.atomic(using=WRITE_DB):` 를 담당한다. helper를 여러 컨텍스트에서 재사용할 때 유연성이 높아지지만, caller가 alias를 일관되게 지정하는 책임을 진다.
+
+### 중첩 atomic과 savepoint
+
+`atomic(using=WRITE_DB)` 내부에서 다시 `atomic(using=WRITE_DB)`를 호출하면 Django는 SAVEPOINT를 설정한다. 내부 atomic에서 예외가 발생하더라도, 그 예외가 내부 block 밖에서 잡혀 처리될 때만 SAVEPOINT까지만 롤백하고 외부 트랜잭션은 계속된다. 예외가 처리되지 않고 외부 atomic 밖까지 전파되면 외부 트랜잭션도 롤백된다. 외부 atomic이 예외 없이 정상 종료되면 외부 트랜잭션은 커밋된다.
+
+alias가 다른 두 atomic을 중첩하면(`atomic(using='default')` 안에 `atomic(using='primary')`) 각 connection에 독립적인 트랜잭션이 열린다. 두 트랜잭션은 원자적으로 연동되지 않는다. 한쪽이 롤백되어도 다른 쪽은 커밋될 수 있다.
+
+## 검증 방법
+
+### 다중 alias 테스트 설정
+
+`TransactionTestCase`를 사용하면 실제 트랜잭션 동작을 테스트할 수 있다. `TestCase`는 테스트를 트랜잭션으로 감싸기 때문에 rollback 동작이 예상과 다르게 작동할 수 있다.
+
+```python
+from django.test import TransactionTestCase
+
+class AliasRollbackTest(TransactionTestCase):
+    databases = {"default", "primary"}  # 테스트에서 사용할 alias 선언
+
+    def test_partial_commit_does_not_happen(self):
+        with self.assertRaises(SomeExpectedError):
+            create_job_with_failing_followup(payload={...})
+
+        # primary DB에 레코드가 남지 않아야 함
+        self.assertFalse(
+            Job.objects.using("primary").filter(...).exists()
+        )
+        self.assertFalse(
+            Schedule.objects.using("primary").filter(...).exists()
+        )
+```
+
+중간 예외 이후 writer DB의 레코드가 모두 롤백됐는지 명시적으로 확인한다.
+
+### on_commit 미실행 검증
+
+롤백 경로에서 `on_commit` 콜백이 실행되지 않아야 한다.
+
+```python
+def test_on_commit_not_called_on_rollback(self):
+    with patch("myapp.orders.notify_status_change") as mock_notify:  # 테스트 대상 모듈의 call site를 patch
+        with self.assertRaises(Exception):
+            process_order_with_error(order_id=1)
+
+    mock_notify.assert_not_called()
+```
+
+정상 커밋 경로에서는 콜백이 실행되는지도 함께 검증한다.
+
+### 실패 응답 반환 경로 검증
+
+`set_rollback(True, using=WRITE_DB)` 후 `return`하는 경로에서도 writer alias 변경이 롤백되고, 반환된 응답 envelope는 유지돼야 한다.
+
+```python
+def test_failure_response_rolls_back_writer_and_preserves_envelope(self):
+    result = create_job_with_failing_followup(payload={...})
+
+    self.assertEqual(result, {"ok": False})  # 응답 envelope 유지
+
+    # writer alias의 레코드가 롤백됐는지 확인
+    self.assertFalse(
+        Job.objects.using("primary").filter(...).exists()
+    )
+    self.assertFalse(
+        Schedule.objects.using("primary").filter(...).exists()
+    )
+```
+
+### alias 오지정과 TransactionManagementError
+
+잘못된 alias에 `set_rollback(True)`를 호출하면 두 가지 경로로 문제가 생긴다.
+
+- **경우 1 — active atomic이 없는 경우**: 잘못된 alias에 active atomic block이 없으면 즉시 `TransactionManagementError`가 발생한다. 이 예외가 writer atomic 밖으로 전파되면 writer도 예외 종료해 롤백된다. 의도한 실패 응답 대신 예상치 못한 예외가 호출자에게 전달된다.
+- **경우 2 — 잘못된 alias에도 active atomic이 있는 경우**: 그 alias에 별도의 active atomic이 열려 있으면 `TransactionManagementError`는 발생하지 않는다. rollback flag는 그 엉뚱한 connection에만 설정되고, writer atomic은 예외 없이 종료돼 커밋될 수 있다. 의도한 롤백이 writer에 적용되지 않는다.
+
+각 경우를 테스트 아이디어로 구분해 검증한다.
+
+```python
+from django.db.transaction import TransactionManagementError
+
+# 경우 1: 잘못된 alias에 active atomic이 없으면 즉시 TME, writer도 롤백
+def test_set_rollback_on_inactive_alias_raises(self):
+    with self.assertRaises(TransactionManagementError):
+        with transaction.atomic(using="default"):
+            transaction.set_rollback(True, using="primary")  # 'primary'에 active atomic 없음
+
+# 경우 2: 잘못된 alias에도 active atomic이 있으면 그 connection만 rollback flag, writer는 커밋 가능
+def test_wrong_alias_rollback_does_not_affect_writer(self):
+    job = None
+    with transaction.atomic(using="default"):        # 'default' active
+        with transaction.atomic(using="primary"):    # 'primary' writer active
+            job = Job.objects.using("primary").create(**payload)
+            transaction.set_rollback(True)           # using 없음 → 'default'에만 flag
+            # inner atomic 예외 없이 종료 → 'primary' 커밋
+        # 'primary' 커밋, 'default' rollback flag → outer 종료 시 default 롤백
+    # 'primary'에 Job 레코드가 남아 있음을 확인
+    self.assertTrue(Job.objects.using("primary").filter(id=job.id).exists())
+```
+
+alias 오지정 탐지는 alias별 레코드 유무를 교차 비교하는 단순 equality로 검증하지 않는다. 서로 다른 DB이거나 같은 물리 DB를 별도 connection으로 바라볼 수 있어 그 단언이 부정확하다. 대신 다음 방법을 사용한다.
+
+- **writer alias 레코드 부재 확인**: 롤백이 됐다면 `using("primary")`로 조회한 레코드가 없어야 한다.
+- **connection의 `in_atomic_block` 관찰**: `from django.db import connections; connections["primary"].in_atomic_block`으로 atomic 진입 여부를 확인한다.
+- **mock으로 `using` 인자 검증**: `set_rollback` 호출 시 어떤 alias가 전달됐는지 mock으로 단언한다. 라이브러리 원본이 아니라 테스트 대상 모듈이 import한 call site를 patch해야 한다.
+
+```python
+from unittest.mock import patch
+
+def test_set_rollback_uses_correct_alias(self):
+    # 테스트 대상 모듈이 import한 call site를 patch
+    with patch("myapp.jobs.transaction.set_rollback") as mock_set_rb:
+        create_job(payload={...})
+
+    mock_set_rb.assert_called_with(True, using="primary")
+```
+
+## 배운 것
+
+`transaction.atomic()` 하나가 모든 DB 쓰기를 보호한다는 가정은 다중 alias 환경에서 성립하지 않는다. Django의 트랜잭션 상태는 connection alias 단위로 분리되며, alias를 명시하지 않으면 `default` connection에만 적용된다.
+
+router가 쓰기를 다른 alias로 보내는 환경에서 alias 없는 `atomic()`을 쓰면, atomic이 열어 놓은 connection과 ORM이 실제로 쓰는 connection이 달라진다. 이 불일치는 코드를 읽어서는 보이지 않고, 부분 커밋이 발생한 뒤에야 DB 상태를 조회해 확인할 수 있다.
+
+`set_rollback(True)`를 잘못된 alias로 호출하면 두 가지 결과가 생긴다. 잘못된 alias에 active atomic이 없으면 즉시 `TransactionManagementError`가 발생해 의도한 실패 응답 계약이 깨진다. 잘못된 alias에도 active atomic이 있으면 그 connection에만 rollback flag가 설정되고, writer atomic은 예외 없이 종료돼 커밋될 수 있다. broad `except Exception`에서 예외를 삼키고 응답을 반환하는 패턴과 alias 오지정이 겹치면, 실패 응답을 반환했음에도 writer DB에 변경이 남는 상태가 생길 수 있다.
+
+원칙은 단순하다. read-modify-write 경로에서 `using=WRITE_DB`를 `.using()`, `atomic()`, `.save()`, `on_commit()` 전부에 일관되게 명시하고, 예외는 삼키지 않고 atomic 블록 밖으로 전파한다. atomic 내부에서 실패 응답을 반환해야 한다면 `set_rollback(True, using=WRITE_DB)`를 같은 alias로 호출하고 `return`하면 해당 connection이 롤백된다. flag 설정 이후 같은 alias에 쿼리를 추가하지 않도록 즉시 반환한다.
