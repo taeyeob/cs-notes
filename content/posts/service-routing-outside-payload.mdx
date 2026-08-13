@@ -1,0 +1,213 @@
+---
+title: "서비스 위치와 라우팅 정책은 비즈니스 데이터가 아니다"
+date: "2026-08-13"
+summary: "교차 서비스 승인 흐름에서 callback URL과 opt-in 플래그를 요청 payload나 DB에 저장하던 설계를 제거하고, base URL은 배포 설정, path는 코드 계약, 호출 여부는 기존 도메인 식별자로 결정하는 방식으로 단순화한 경험을 일반화한다."
+tags:
+  - backend
+  - architecture
+  - reliability
+  - configuration
+  - security
+---
+
+## 문제 정의
+
+두 내부 서비스가 교차 승인 흐름으로 연동될 때 흔히 이런 설계가 등장한다.
+
+```python
+# illustrative pseudocode
+approval_request = {
+    "resource_id": "...",
+    "callback_url": "...",       # 승인 결과를 보낼 URL
+    "require_validation": True,  # 검증 서비스 호출 여부
+}
+```
+
+`callback_url`은 호출자가 요청마다 직접 전달하고, DB에 그대로 저장된다. `require_validation`은 리소스 유형별로 true/false를 payload로 내려보낸다.
+
+처음에는 유연해 보인다. 그러나 이 설계가 시스템을 복잡하게 만드는 방식은 조용하다.
+
+## 동적 URL 필드가 만드는 문제
+
+### 스키마와 배포 토폴로지의 결합
+
+callback URL이 payload에 들어오는 순간, **API 스키마가 배포 환경의 네트워크 토폴로지를 반영하기 시작한다.** 로컬·스테이징·프로덕션마다 다른 host를 가진 URL이 요청에 섞이고, 어느 환경에서 어느 URL이 유효한지 추론해야 한다.
+
+### Stale URL의 영속화
+
+DB에 저장된 URL은 시간이 지나면 상하기 시작한다. 서비스 이름이 바뀌거나 ingress path가 변경되면, 저장된 레코드에 박힌 URL은 그대로 남는다. 재처리·재승인 시 과거 레코드를 읽어 호출하면 404나 연결 실패로 이어진다.
+
+### 생산자·소비자 스키마 변경 부담
+
+호출 서비스가 자신의 URL을 payload로 내려보내야 하므로, 수신 서비스의 스키마 변경이 송신 서비스의 변경을 강제한다. 두 서비스 팀이 별도의 배포 주기를 갖는다면 이 결합은 실질적인 조율 비용이 된다.
+
+### 테스트 조합 증가
+
+URL 필드가 검증 대상이 되는 순간, "어떤 URL이 허용되는가"에 대한 테스트 케이스가 생긴다. 빈 문자열, 잘못된 형식, 내부망 외 주소, 상대 경로 등을 모두 경계로 다뤄야 한다.
+
+### 조건부 SSRF 공격면과 검증 부담
+
+URL을 외부에서 주입받아 서버가 직접 호출하는 구조는, 그 URL이 내부 네트워크 자원을 가리킬 수 있을 때 SSRF(Server-Side Request Forgery) 공격면이 된다. 단일 조직 내부 연동처럼 **호출자가 이미 신뢰된 내부 서비스라면 실제 위험은 제한적**이지만, 계층 간에 URL이 전달·저장·재사용될수록 검증 책임이 커진다. URL의 출처(origin)가 허용 목록에 있는지 확인하는 helper가 필요해지고, 그 helper 자체가 유지보수 대상이 된다.
+
+## 단순화된 설계: 세 가지 책임 분리
+
+핵심 질문은 하나다. **"이 서비스가 어디에 있는가"와 "이 리소스를 검증해야 하는가"는 비즈니스 데이터인가?**
+
+고정된 내부 연동에서는 아니다. 이 두 정보는 각각 다른 곳에 속한다.
+
+### 1. Base URL은 배포 설정이다
+
+```python
+# illustrative pseudocode
+import os
+
+VALIDATOR_BASE_URL = os.environ.get("VALIDATOR_SERVICE_BASE_URL")
+
+def get_validator_base_url() -> str:
+    url = VALIDATOR_BASE_URL
+    if not url:
+        raise ConfigurationError("VALIDATOR_SERVICE_BASE_URL is not set")
+    return url.rstrip("/")
+```
+
+`VALIDATOR_SERVICE_BASE_URL`은 환경 변수로 주입된다. 로컬·스테이징·프로덕션이 각자 다른 값을 가진다. 요청 payload에도, DB에도, 코드 상수에도 들어가지 않는다.
+
+**Base URL이 설정되지 않으면 민감한 승인 흐름은 진행하지 않는다.** 설정 누락은 조용히 기본값으로 fallback하는 것이 아니라, 명시적인 retryable 오류로 처리한다. 잘못된 대상에 승인 요청을 보내는 것보다 중단이 낫다.
+
+### 2. Path는 코드 계약이다
+
+```python
+# illustrative pseudocode
+VALIDATION_PATH = "/v1/resources/{resource_id}/validate"
+
+def build_validation_url(base_url: str, resource_id: str) -> str:
+    path = VALIDATION_PATH.format(resource_id=resource_id)
+    return base_url + path
+```
+
+호출 경로는 코드에 고정된다. 두 서비스가 이 path를 공유 계약으로 삼는다. 변경하려면 양쪽 코드를 함께 수정하고, 선배포 순서를 명시한다(후술).
+
+### 3. 호출 여부는 기존 도메인 식별자로 결정한다
+
+opt-in boolean(`require_validation: true`) 대신, 이미 리소스에 부여된 도메인 식별자를 사용한다.
+
+```python
+# illustrative pseudocode
+RESOURCE_TYPE_STANDARD = "standard"
+RESOURCE_TYPE_EXCEPTION = "exception"
+
+def needs_external_validation(resource_type):
+    return resource_type in (RESOURCE_TYPE_STANDARD, RESOURCE_TYPE_EXCEPTION)
+```
+
+중요한 전제가 있다. **이 분류가 실제 정책 경계와 일치하는지 검증해야 한다.** 도메인 식별자가 생긴 맥락과 검증 정책의 경계가 다를 수 있다. 코드에 분류 기준을 추가하기 전에, 두 기준이 실제로 같은 집합을 가리키는지 확인한다.
+
+## 대상 서비스의 분류와 응답 처리
+
+검증을 수행하는 서비스(validator)는 호출받은 리소스를 자기 원장 기준으로 네 가지로 분류한다.
+
+| 분류                 | 의미                      | 처리                                      |
+| -------------------- | ------------------------- | ----------------------------------------- |
+| `valid`              | 승인 가능한 일반 리소스   | 다음 승인 단계로 진행                     |
+| `invalid`            | 규칙 위반, 승인 거부 대상 | business invalid — terminal 처리          |
+| `exception_resource` | 정책 예외 리소스          | 별도 승인 경로로 분기                     |
+| `unknown`            | 원장에 없거나 분류 불가   | fail-closed terminal rejection, 운영 알림 |
+
+**`unknown`은 fail-closed terminal rejection이다.** validator가 자기 원장 기준으로 분류한 명시적 business invalid이므로 `invalid`와 동일하게 terminal로 처리한다. 모르는 리소스를 승인하는 것은 모르는 리소스를 거부하는 것보다 훨씬 위험하다. unknown 응답은 caller가 terminal rejection으로 처리하고, 운영팀이 확인할 수 있도록 알림을 남기는 흐름으로 이어진다.
+
+## Business Invalid와 Transient Failure의 상태 전이 분리
+
+이 설계에서 가장 중요한 운영 결정 중 하나다.
+
+```python
+# illustrative pseudocode
+def handle_validation_response(response, approval_request):
+    if response.status_code == 200:
+        result = parse_json(response.body)
+        if result is None:                                     # JSON 파싱 실패: 상태 유지, retryable
+            mark_as_retryable(approval_request)
+            return
+
+        classification = result.get("classification")
+
+        if classification == "valid":
+            proceed_to_next_approval_step(approval_request)
+        elif classification == "invalid":
+            mark_as_business_rejected(approval_request)        # terminal, validator 명시적 거부
+        elif classification == "exception_resource":
+            route_to_exception_approval_path(approval_request)
+        elif classification == "unknown":
+            mark_as_business_rejected(approval_request)        # terminal, fail-closed
+            notify_operations(approval_request)                # 운영 알림
+        else:
+            mark_as_retryable(approval_request)                # 예상 밖 classification: 상태 유지
+
+    elif response.status_code in (500, 502, 503, 504):
+        mark_as_retryable(approval_request)                    # 5xx: transient
+
+    elif is_timeout(response):
+        mark_as_retryable(approval_request)                    # timeout: transient
+
+    else:
+        mark_as_retryable(approval_request)                    # 인식되지 않은 오류(4xx 등): 상태 유지
+```
+
+**핵심 원칙은 두 가지다.**
+
+첫째, **성공(HTTP 200 + valid 분류)만 다음 승인으로 진행한다.** "응답이 왔으니 일단 통과"는 없다. 200 응답이어도 body의 classification을 반드시 확인한다.
+
+둘째, **validator가 명시적으로 계약한 business invalid(`invalid`, `unknown`)만 terminal로 처리한다.** `invalid`와 `unknown`은 validator의 원장 기준에서 나온 명시적 거부 분류이므로 재시도해도 결과가 바뀌지 않는다. 반면 timeout, 5xx, 인식되지 않은 4xx, JSON 파싱 실패, 예상 밖 HTTP 200 classification은 상태를 유지한 채 retryable로 처리한다. validator 일시 장애나 계약 외 응답이 요청을 영구 소멸시키면 안 된다.
+
+## 배포 순서와 트레이드오프
+
+Path가 코드 계약이 된 이상, path가 바뀔 때 배포 순서가 중요하다.
+
+**권장 순서: 제공 서비스 선배포 → caller 설정 주입 확인 → caller 배포**
+
+1. validator가 새 path를 먼저 배포한다. 이 시점에는 caller가 아직 기존 path를 쓰므로 트래픽 단절이 없다.
+2. validator가 구 path도 일정 기간 지원하거나, caller가 아직 구 버전을 쓰는 구간을 허용한다.
+3. caller 배포 전 환경 변수(base URL)가 올바르게 주입되어 있는지 확인한다.
+4. caller를 배포한다.
+
+**Rollback 트레이드오프:** caller만 롤백하면 구 path 호출로 돌아가므로 안전하다. validator만 롤백하면 caller가 호출하는 path가 사라지므로 호출 실패가 발생한다. 양쪽을 동시에 롤백하면 안전하지만 조율 비용이 높다. 이 결합 비용이 존재한다는 사실을 배포 계획에 명시한다.
+
+**Feature coupling 트레이드오프:** base URL 환경 변수가 주입되지 않으면 caller가 명시적 오류를 낸다. 이는 의도된 동작이다. "설정이 없으면 그냥 건너뛴다"는 silent skip은 검증이 실행되지 않은 채 승인 흐름이 진행될 수 있다는 뜻이다.
+
+## 검증 매트릭스
+
+설계를 코드로 구현한 뒤 아래 케이스를 모두 통과시켜야 한다.
+
+| #   | 시나리오                                                        | 기대 상태 전이                            |
+| --- | --------------------------------------------------------------- | ----------------------------------------- |
+| 1   | 일반 리소스, validator → `valid`                                | 다음 승인 진행                            |
+| 2   | 일반 리소스, validator → `invalid`                              | business rejected (terminal)              |
+| 3   | 예외 리소스, validator → `exception_resource`                   | 예외 승인 경로 분기                       |
+| 4   | unknown 리소스, validator → `unknown`                           | business rejected (terminal), 운영 알림   |
+| 5   | `VALIDATOR_SERVICE_BASE_URL` 미설정                             | ConfigurationError, 상태 유지 (retryable) |
+| 6   | validator timeout                                               | retryable, 상태 유지                      |
+| 7   | validator HTTP 5xx                                              | retryable, 상태 유지                      |
+| 8   | validator HTTP 4xx (인식되지 않은)                              | retryable, 상태 유지                      |
+| 9   | validator HTTP 200, JSON 파싱 실패                              | retryable, 상태 유지                      |
+| 10  | validator HTTP 200, classification 예상 밖 값                   | retryable, 상태 유지                      |
+| 11  | 비대상 도메인 식별자 리소스 (needs_external_validation → False) | 로컬 처리, validator 미호출               |
+| 12  | 이미 terminal 상태인 요청에 재호출 시도                         | 재처리 거부, 멱등 보장                    |
+
+케이스 5는 통합 테스트에서 환경 변수를 명시적으로 제거한 상태로 실행한다. 케이스 11은 도메인 식별자 분류 함수의 단위 테스트로 고정한다.
+
+## 적용 예외: URL이 진짜 비즈니스 데이터인 경우
+
+이 설계는 **호출 대상이 고정된 내부 서비스 연동**에 적용한다.
+
+반대로 **사용자 정의 webhook이나 tenant별 callback URL처럼 URL 자체가 비즈니스 의미를 가지는 경우**는 다르다. 테넌트마다 서로 다른 외부 엔드포인트에 이벤트를 보내야 한다면 URL은 설정이 아니라 도메인 데이터다. 이 경우에도 URL 검증(허용 목록, origin 확인)과 저장 정책은 별도로 설계해야 하지만, payload/DB에 저장한다는 결정 자체는 타당하다.
+
+"고정된 내부 연동인가, tenant별 동적 callback인가"를 먼저 구분하고 설계를 선택한다.
+
+## 배운 점
+
+**서비스 위치는 인프라 계층이 알고, 호출 여부는 도메인 계층이 안다.** 이 두 정보를 API payload나 DB 레코드에 섞으면, 두 계층의 변경이 서로를 잠근다.
+
+동적 URL 필드를 제거했을 때 사라진 것들: URL 검증 helper, origin 허용 목록 관리, stale URL 정리 배치, 환경별 URL 생성 로직, URL 관련 테스트 케이스. 추가로 얻은 것: 배포 환경 변수 하나, 코드에 고정된 path 상수 하나.
+
+opt-in boolean을 도메인 식별자로 교체했을 때 생긴 질문이 더 유용했다. "이 플래그가 어떤 조건에서 true인가?" 대신 "이 분류 기준이 정말 검증 정책 경계와 같은가?"를 물어야 했다. 두 번째 질문이 훨씬 정확한 경계를 드러냈다.
+
+마지막으로, business invalid와 transient failure를 다른 상태 전이로 처리하는 것은 단순히 코드 분기 문제가 아니다. 운영 중 어떤 실패가 자동 재시도로 회복되고 어떤 실패가 사람의 확인을 필요로 하는지를 시스템이 명확히 표현하는 방법이다.
