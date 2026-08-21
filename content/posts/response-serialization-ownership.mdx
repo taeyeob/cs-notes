@@ -1,0 +1,339 @@
+---
+title: "출력 Serializer가 응답 계약을 소유해야 하는 이유"
+date: "2026-08-21"
+summary: "컨트롤러가 ORM 모델을 dict로 미리 조립한 뒤 Serializer에 넘기는 이중 변환 패턴의 문제를 설명하고, 출력 Serializer가 표현(representation)의 source of truth가 되도록 책임을 재배치하는 설계와 단계적 리팩터링 방법을 정리한다."
+tags:
+  - backend
+  - api
+  - django
+  - drf
+  - serializer
+  - design
+---
+
+## 문제 정의
+
+Django REST Framework로 API를 작성하다 보면 모델 인스턴스를 조회한 뒤 컨트롤러 안에서 dict를 직접 조립해 응답으로 내려보내는 코드를 자주 만난다.
+
+```python
+# view 또는 controller
+product = Product.objects.get(id=product_id)
+data = {
+    "id": product.id,
+    "name": product.name,
+    "price": str(product.price),
+    "category_name": product.category.name,
+    "is_available": product.stock > 0,
+}
+return Response(data)
+```
+
+Serializer를 쓰더라도 이중 변환 패턴이 나타나는 경우가 있다.
+
+```python
+data = {
+    "id": product.id,
+    "name": product.name,
+    "price": str(product.price),
+    "category_name": product.category.name,
+    "is_available": product.stock > 0,
+}
+serializer = ProductOutputSerializer(data=data)
+serializer.is_valid()
+return Response(serializer.data)
+```
+
+`data=dict`로 Serializer를 호출하면 입력 검증 경로로 진입한다. Serializer는 dict를 받아 필드 타입을 검증하는 역할만 하고, 모델 인스턴스의 관계 필드나 파생값 계산을 직접 담당하지 않는다. 이중 변환이 만드는 문제는 세 가지다.
+
+- **응답 계약이 컨트롤러에 분산된다.** `str(product.price)` 같은 타입 변환, `product.stock > 0` 같은 파생값, `product.category.name` 같은 관계 필드 접근이 view마다 복사된다. 필드를 추가하거나 바꿀 때 수정 지점이 view 수만큼 늘어난다.
+- **Serializer의 역할이 불분명해진다.** 모델 인스턴스를 받아 응답 표현을 생성하는 본래 역할에서 멀어진다.
+- **파생값 계산이 여러 곳에 중복된다.** `is_available` 계산이 view, task, template에 흩어지면 어느 값이 정확한지 추적하기 어렵다.
+
+기존 글([api-boundary-parser-serializer-contract](/posts/api-boundary-parser-serializer-contract), [request-serializer-contract](/posts/request-serializer-contract))에서는 입력 경계와 요청 검증 책임을 다뤘다. 이 글은 반대 방향인 출력 경계에 집중한다. 입력 Serializer가 `validated_data`를 소유한다면, 출력 Serializer는 `representation`을 소유해야 한다.
+
+## DRF 호출 의미: 입력 vs 출력 경로
+
+DRF Serializer는 호출 방식에 따라 두 경로로 나뉜다.
+
+| 경로 | 호출 방식 | 목적 |
+|---|---|---|
+| 입력 검증 | `Serializer(data=request.data)` + `is_valid()` | 외부 입력을 받아 검증하고 `validated_data`를 생성한다 |
+| 출력 직렬화 | `Serializer(instance)` 또는 `Serializer(qs, many=True)` + `.data` | 모델 인스턴스를 받아 응답 representation을 생성한다 |
+
+출력 경로에서는 `is_valid()` 호출이 없다. 첫 번째 위치 인자로 인스턴스나 queryset을 넘기고, `.data` 프로퍼티로 직렬화된 dict를 꺼낸다.
+
+## 권장 책임 흐름
+
+출력 Serializer가 응답 계약을 소유하도록 책임을 재배치하면 흐름이 다음처럼 바뀐다.
+
+```
+View / Controller  →  queryset 또는 model instance (쿼리 실행·비즈니스 로직 담당)
+출력 Serializer   →  응답 키셋, 타입, 응답 전용 파생값, 누락값 정책의 단일 소유자
+응답 representation
+```
+
+도메인 규칙, 집계, 쿼리 실행은 모델·서비스·QuerySet annotation 쪽 책임으로 남긴다. 출력 Serializer는 이미 계산된 값을 어떻게 표현할지만 결정한다. `is_available` 같은 도메인 규칙은 모델 property가 소유하고, Serializer는 그 값을 표현만 한다.
+
+```python
+class Product(models.Model):
+    stock = models.IntegerField(default=0)
+
+    @property
+    def is_available(self) -> bool:
+        return self.stock > 0
+
+
+class ProductOutputSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name")
+    is_available = serializers.BooleanField(read_only=True)
+    price = serializers.DecimalField(max_digits=12, decimal_places=2, coerce_to_string=True)
+
+    class Meta:
+        model = Product
+        fields = ["id", "name", "price", "category_name", "is_available"]
+
+
+class ProductDetailView(APIView):
+    def get(self, request, product_id):
+        product = Product.objects.select_related("category").get(id=product_id)
+        return Response(ProductOutputSerializer(product).data)
+
+
+class ProductListView(APIView):
+    def get(self, request):
+        queryset = Product.objects.select_related("category").filter(is_active=True)
+        return Response(ProductOutputSerializer(queryset, many=True).data)
+```
+
+`price`에 `coerce_to_string=True`를 명시하면 전역 `COERCE_DECIMAL_TO_STRING` 설정과 무관하게 문자열을 반환하는 응답 계약이 된다. 응답 필드를 추가하거나 변경할 때 `ProductOutputSerializer` 한 곳만 수정한다.
+
+## 단계적 리팩터링
+
+이중 변환 패턴이 이미 퍼져 있을 때 두 단계로 접근한다.
+
+**1단계: dict 구성을 Serializer 필드로 이동한다.**
+
+```python
+class ProductOutputSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    price = serializers.DecimalField(max_digits=12, decimal_places=2, coerce_to_string=True)
+    category_name = serializers.CharField(source="category.name")
+    is_available = serializers.BooleanField(read_only=True)
+```
+
+**2단계: 컨트롤러에서 dict 조립을 제거하고 인스턴스를 넘긴다.**
+
+```python
+return Response(ProductOutputSerializer(product).data)
+```
+
+두 단계를 동시에 진행하기 어려울 때는 다음 순서로 안전하게 전환한다.
+
+1. 기존 응답의 contract test를 먼저 고정한다. 엔드포인트 응답에서 키셋, 타입, 경계값을 검증하는 테스트를 작성해 현재 동작을 명세화한다.
+2. 엔드포인트별로 `ProductOutputSerializer(instance)` 경로로 전환한다.
+3. 1단계 contract test를 재실행해 old/new representation이 동일한지 확인한다. 키셋이나 값이 달라졌다면 Serializer 필드 선언을 맞춘다.
+
+## 계산 필드, 허용 projection, 누락값 정책
+
+### 응답 전용 파생값
+
+집계·계산이 필요한 파생값은 모델 property나 QuerySet `annotate`로 미리 계산하고, Serializer는 그 값을 표현만 한다. `remaining_budget`은 View에서 `annotate`로 계산하고 Serializer는 `DecimalField(read_only=True)`로 표현한다.
+
+```python
+class CampaignOutputSerializer(serializers.ModelSerializer):
+    remaining_budget = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True
+    )
+
+    class Meta:
+        model = Campaign
+        fields = ["id", "name", "budget", "spent", "remaining_budget"]
+```
+
+### 허용 키 projection
+
+저장된 매핑에서 특정 키만 응답에 포함할 때도 Serializer가 projection 계약을 소유한다.
+
+```python
+ALLOWED_CURRENCIES = ("krw", "jpy", "usd", "cny")
+
+
+class ItemOutputSerializer(serializers.ModelSerializer):
+    price_by_currency = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Item
+        fields = ["id", "name", "price_by_currency"]
+
+    def get_price_by_currency(self, obj):
+        # whitelist 순서대로 투영한다. 통화 값을 새로 계산하지 않는다.
+        return {k: obj.price_by_currency[k] for k in ALLOWED_CURRENCIES if k in obj.price_by_currency}
+```
+
+`eur` 같은 허용 목록 외 키는 응답에 포함되지 않는다. `fields = "__all__"`은 모델 컬럼이 추가될 때마다 응답 계약이 자동으로 바뀐다. 항상 명시적인 필드 목록을 선언한다.
+
+### 누락값 정책
+
+```python
+class ProductNullableFieldsSerializer(serializers.ModelSerializer):
+    description = serializers.CharField(allow_null=True, default=None)
+    discount_rate = serializers.DecimalField(
+        max_digits=5, decimal_places=2, allow_null=True, default=None
+    )
+
+    class Meta:
+        model = Product
+        fields = ["id", "name", "description", "discount_rate"]
+```
+
+`description`이 없을 때 키를 생략할지, `null`로 내려줄지를 Serializer가 결정한다. 이 결정이 컨트롤러에 있으면 엔드포인트마다 다른 동작을 하게 된다.
+
+## 쿼리 계획
+
+모델 인스턴스를 Serializer에 넘긴다고 해서 N+1이 자동으로 해결되지 않는다. `select_related`나 `prefetch_related`를 명시하지 않으면 Serializer가 관계 필드에 접근할 때마다 개별 쿼리가 발생한다.
+
+```python
+# 위험: category 접근 시 N개 추가 쿼리 발생
+products = Product.objects.filter(is_active=True)
+serializer = ProductOutputSerializer(products, many=True)  # product 수만큼 category 쿼리
+
+# 안전: select_related는 SQL JOIN으로 관계를 한 번에 가져온다
+products = Product.objects.select_related("category").filter(is_active=True)
+serializer = ProductOutputSerializer(products, many=True)
+```
+
+집계가 필요할 때는 queryset에 `annotate`를 붙이고 Serializer에서 `obj.annotated_field`로 접근한다. Serializer 안에서 `obj.orders.count()`를 호출하는 방식은 N+1을 유발한다.
+
+쿼리 계획은 Serializer가 아니라 View 또는 QuerySet 레이어에서 담당한다.
+
+## 트레이드오프
+
+### ModelSerializer vs plain Serializer
+
+ModelSerializer는 모델 필드와 자동 연결되어 선언량이 줄어든다. 반면 `fields = "__all__"`이나 암묵적 연결은 응답 계약을 모델 구조에 강하게 결합한다.
+
+plain `Serializer`는 선언이 명시적이고 모델과 독립적이다. 비 ORM 출처나 복합 응답에서 자연스럽다.
+
+**plain Serializer나 명시적 DTO가 나은 경우:**
+
+- **비 ORM 집계:** `values()` + `annotate()` 결과는 dict의 QuerySet이다. `source=`로 집계 키를 매핑한다.
+
+```python
+class CategoryStatsSerializer(serializers.Serializer):
+    category_name = serializers.CharField(source="category__name")
+    count = serializers.IntegerField()
+    avg_price = serializers.DecimalField(max_digits=12, decimal_places=2)
+```
+
+- **외부 API 합성:** 외부 응답과 ORM 모델을 합치면 단일 모델에 자연스럽게 매핑되지 않아 plain Serializer나 DTO가 더 명확하다.
+- **리포트·projection:** 여러 테이블을 조인한 flat 구조는 plain Serializer가 가독성이 높다.
+
+### 보조 데이터 사전 계산 또는 DTO가 필요한 경우
+
+Serializer가 쿼리를 실행하거나 외부 시스템에 접근해서는 안 된다. 여러 소스를 합성해야 하는 필드는 View에서 미리 계산한 뒤 `context`로 전달하거나 명시적인 DTO로 표현한다.
+
+```python
+class ProductRecommendationSerializer(serializers.ModelSerializer):
+    recommendation_count = serializers.SerializerMethodField()
+
+    def get_recommendation_count(self, obj):
+        # context에서 미리 계산된 값을 꺼낸다. Serializer 안에서 쿼리를 실행하지 않는다.
+        return self.context.get("recommendation_counts", {}).get(obj.id, 0)
+
+    class Meta:
+        model = Product
+        fields = ["id", "name", "recommendation_count"]
+
+
+class ProductListView(APIView):
+    def get(self, request):
+        products = Product.objects.filter(is_active=True)
+        counts = RecommendationService.get_counts(list(products.values_list("id", flat=True)))
+        return Response(
+            ProductRecommendationSerializer(products, many=True, context={"recommendation_counts": counts}).data
+        )
+```
+
+## 테스트 전략
+
+```python
+from decimal import Decimal
+from django.test import TestCase
+from rest_framework.test import APIClient
+
+
+class TestProductOutputSerializer(TestCase):
+
+    def setUp(self):
+        self.client = APIClient()
+
+    # 1. 응답 키셋 계약
+    def test_응답_키셋이_계약과_일치한다(self):
+        product = ProductFactory(stock=5, category=CategoryFactory(name="Electronics"))
+        response = self.client.get(f"/api/products/{product.id}/")
+        assert response.status_code == 200
+        assert set(response.data.keys()) == {"id", "name", "price", "category_name", "is_available"}
+
+    # 2. 도메인 property 경계값 — model property is_available의 경계를 검증한다
+    def test_재고_0이면_is_available이_False다(self):
+        product = ProductFactory(stock=0)
+        assert self.client.get(f"/api/products/{product.id}/").data["is_available"] is False
+
+    def test_재고_1_이상이면_is_available이_True다(self):
+        product = ProductFactory(stock=1)
+        assert self.client.get(f"/api/products/{product.id}/").data["is_available"] is True
+
+    # 3. 누락값 정책
+    def test_description_없을때_null로_내려온다(self):
+        product = ProductFactory(description=None)
+        assert ProductNullableFieldsSerializer(product).data["description"] is None
+
+    # 4. 허용 projection — 내부 필드가 응답에 없어야 한다
+    def test_내부_원가_필드가_응답에_없다(self):
+        product = ProductFactory()
+        response = self.client.get(f"/api/products/{product.id}/")
+        assert "cost_price" not in response.data
+        assert "internal_notes" not in response.data
+
+
+class TestItemCurrencyProjection(TestCase):
+
+    # 5. 허용 통화 키 projection
+    def test_허용_통화_키만_응답에_포함된다(self):
+        item = ItemFactory(
+            price_by_currency={"krw": 10000, "jpy": 1000, "usd": 8, "cny": 50, "eur": 9}
+        )
+        data = ItemOutputSerializer(item).data
+        assert set(data["price_by_currency"].keys()) == {"krw", "jpy", "usd", "cny"}
+        assert "eur" not in data["price_by_currency"]
+
+
+class TestProductQueryCount(TestCase):
+
+    # 6. 쿼리 수 회귀 — endpoint 레벨에서 eager loading 확인
+    def test_목록_endpoint는_쿼리_1회다(self):
+        # 인증·페이지네이션·미들웨어가 없는 합성 APIView 예시라 1회를 기대한다.
+        # 실제 프로젝트에서는 고정 숫자를 복사하지 말고 해당 엔드포인트의 정상 baseline을 먼저 측정해 고정한다.
+        category = CategoryFactory()
+        ProductFactory.create_batch(5, category=category, is_active=True)
+        with self.assertNumQueries(1):
+            response = self.client.get("/api/products/")
+        assert response.status_code == 200
+        assert len(response.json()) == 5
+
+    # coerce_to_string=True로 선언한 명시적 출력 타입 계약을 검증한다
+    def test_price가_Decimal로_직렬화된다(self):
+        product = ProductFactory(price=Decimal("9900.00"))
+        assert ProductOutputSerializer(product).data["price"] == "9900.00"
+```
+
+`assertNumQueries`로 엔드포인트 레벨 쿼리 수를 고정하면, View에서 `select_related`를 제거했을 때 N+1 증가를 CI에서 감지할 수 있다.
+
+## 배운 것
+
+입력 Serializer가 `validated_data`를 소유하듯, 출력 Serializer는 `representation`을 소유해야 한다. 이 대칭이 명확할 때, 각 계층이 무엇을 책임지는지 코드에서 바로 읽힌다.
+
+출력 Serializer를 응답 계약의 단일 소유자로 두면 네 가지를 한 곳에 선언할 수 있다. 허용 키셋, 응답 전용 파생값 정의, 누락값 정책, 타입 직렬화 방식. 이 네 가지가 한 곳에 선언되면 응답 모양을 추론하기 위해 여러 파일을 찾아다닐 필요가 없다.
+
+모델 인스턴스를 Serializer에 넘기는 것이 N+1을 자동으로 해결하지는 않는다. 쿼리 계획은 View 레이어가 담당하고, 관계 필드는 `select_related`나 `prefetch_related`로 미리 로드해야 한다. `assertNumQueries`로 쿼리 수를 경계로 고정해두면 이 계획이 의도치 않게 깨지는 것을 CI에서 잡을 수 있다.
